@@ -10,8 +10,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
     schematic::{
-        extract_lib_pins, extract_symbol_instances, extract_wires, find_t_junctions,
-        format_junction, format_wire, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_t_junctions, format_junction,
+        format_wire, pin_endpoint, read_schematic,
     },
     writer::{apply_edits, find_block_with_leading_whitespace, write_atomic, SexpEdit},
 };
@@ -1220,12 +1220,12 @@ fn resolve_pin_endpoint(
         .iter()
         .find(|i| i.reference == reference)
         .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_sym = lib_syms
+    lib_syms
         .iter()
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
 
-    let pins = extract_lib_pins(lib_sym);
+    let pins = konnect_sexp::schematic::resolve_lib_pins(lib_syms, &inst.lib_id);
     let lib_pin = pins
         .iter()
         .find(|p| p.number == pin_number)

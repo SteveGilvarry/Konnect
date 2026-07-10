@@ -56,9 +56,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy and page-numbering queries",
+        description: "Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy queries, page renumbering, and whole-project instance repair",
         category: "schematic",
-        tool_count: 7,
+        tool_count: 8,
     },
     ToolsetMeta {
         name: "pcb_board",

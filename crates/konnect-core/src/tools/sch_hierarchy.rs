@@ -145,6 +145,24 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_renumber_sheet_pages(args, ctx).await }
         ),
+        tool!(
+            "repair_hierarchy_instances",
+            "Rewrite the whole project's instance data the way KiCAD itself saves it: \
+             ensure the root schematic has a top-level UUID, then walk every sheet \
+             recursively and rewrite sheet page instances and symbol instance paths as \
+             '/<root-uuid>/<sheet-uuid>' under the given project name. Fixes projects \
+             whose symbols are invisible to kicad-cli (empty netlist/ERC/plots) because \
+             instance paths were written as '/' or under the wrong project name.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Root .kicad_sch of the project" },
+                    "project_name": { "type": "string", "description": "Project name for instance entries. Default: the root file's stem" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_repair_hierarchy_instances(args, ctx).await }
+        ),
     ]
 }
 
@@ -653,6 +671,193 @@ fn renumber_walk(
     }
     visited.remove(&canon);
     Ok(())
+}
+
+async fn handle_repair_hierarchy_instances(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "schematic")?;
+    if !root_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Schematic '{}' not found",
+            root_path.display()
+        )));
+    }
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .or_else(|| {
+            root_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+
+    let mut root = cse::Schematic::load(&root_path)?;
+    let root_uuid = match &root.uuid {
+        Some(u) => u.clone(),
+        None => {
+            let u = uuid::Uuid::new_v4().to_string();
+            root.uuid = Some(u.clone());
+            u
+        }
+    };
+    root.overwrite()?;
+
+    let mut repaired_symbols = 0usize;
+    let mut repaired_sheets = 0usize;
+    let mut files = Vec::new();
+    let mut visited = HashSet::new();
+    repair_walk(
+        &root_path,
+        &project_name,
+        &format!("/{}", root_uuid),
+        &mut repaired_symbols,
+        &mut repaired_sheets,
+        &mut files,
+        &mut visited,
+    )?;
+
+    Ok(CallToolResult::json(&json!({
+        "project_name": project_name,
+        "root_uuid": root_uuid,
+        "repaired_symbol_instances": repaired_symbols,
+        "repaired_sheet_instances": repaired_sheets,
+        "files": files
+    })))
+}
+
+/// Rewrite instance data for the schematic at `path`, whose hierarchical
+/// prefix (KiCAD-style, starting at the root schematic UUID) is `prefix`,
+/// then recurse into its sub-sheets.
+fn repair_walk(
+    path: &Path,
+    project_name: &str,
+    prefix: &str,
+    repaired_symbols: &mut usize,
+    repaired_sheets: &mut usize,
+    files: &mut Vec<Value>,
+    visited: &mut HashSet<PathBuf>,
+) -> anyhow::Result<()> {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon.clone()) {
+        return Ok(()); // cycle guard
+    }
+
+    let mut sch = cse::Schematic::load(path)?;
+    let dir = parent_dir(path);
+    let mut sym_count = 0usize;
+    let mut sheet_count = 0usize;
+
+    // Older Konnect builds embedded unit sub-symbols with a "Lib:" prefix
+    // ("Device:R_0_1"), which makes KiCAD reject the whole file. Strip the
+    // prefix from nested unit names so they match KiCAD's expected format.
+    let renamed_units = fix_embedded_unit_names(&mut sch);
+
+    for sym in sch.symbols.iter_mut() {
+        let reference = sym.reference().unwrap_or("").to_string();
+        let unit = sym.unit;
+        sym.clear_instances();
+        sym.set_instance_path(project_name, prefix, &reference, unit);
+        sym_count += 1;
+    }
+
+    // Snapshot sheet data before recursing (needs `sch` unborrowed below).
+    let mut children: Vec<(String, String)> = Vec::new(); // (uuid, file)
+    for sheet in sch.sheets.iter_mut() {
+        let page = sheet
+            .instances
+            .first()
+            .map(|i| i.page.clone())
+            .unwrap_or_default();
+        sheet.instances.clear();
+        sheet.set_page(project_name, prefix, &page);
+        sheet_count += 1;
+        children.push((sheet.uuid.clone(), sheet.file().to_string()));
+    }
+
+    if sym_count > 0 || sheet_count > 0 || renamed_units > 0 {
+        sch.overwrite()?;
+    }
+    *repaired_symbols += sym_count;
+    *repaired_sheets += sheet_count;
+    files.push(json!({
+        "file": path.display().to_string(),
+        "symbols": sym_count,
+        "sheets": sheet_count,
+        "renamed_unit_symbols": renamed_units,
+        "path_prefix": prefix
+    }));
+
+    for (sheet_uuid, file) in children {
+        let child_path = dir.join(&file);
+        if child_path.exists() {
+            repair_walk(
+                &child_path,
+                project_name,
+                &format!("{}/{}", prefix, sheet_uuid),
+                repaired_symbols,
+                repaired_sheets,
+                files,
+                visited,
+            )?;
+        }
+    }
+
+    visited.remove(&canon);
+    Ok(())
+}
+
+/// Strip erroneous "Lib:" prefixes from nested unit sub-symbol names inside a
+/// schematic's lib_symbols table: `(symbol "Device:R" ... (symbol "Device:R_0_1"`
+/// becomes `(symbol "Device:R" ... (symbol "R_0_1"`. Returns how many nested
+/// names were rewritten.
+fn fix_embedded_unit_names(sch: &mut cse::Schematic) -> usize {
+    use cse::sexp::SexpNode;
+    let mut renamed = 0usize;
+    for node in sch.raw_other.iter_mut() {
+        if node.tag() != Some("lib_symbols") {
+            continue;
+        }
+        let SexpNode::List(entries) = node else {
+            continue;
+        };
+        for entry in entries.iter_mut().skip(1) {
+            if entry.tag() != Some("symbol") {
+                continue;
+            }
+            let Some(top_name) = entry.value().map(str::to_owned) else {
+                continue;
+            };
+            let SexpNode::List(sub_nodes) = entry else {
+                continue;
+            };
+            for sub in sub_nodes.iter_mut().skip(1) {
+                if sub.tag() != Some("symbol") {
+                    continue;
+                }
+                let Some(sub_name) = sub.value().map(str::to_owned) else {
+                    continue;
+                };
+                // Qualified nested unit name ("Lib:Base_u_s") → strip to "Base_u_s"
+                if let Some((_, bare)) = sub_name.split_once(':') {
+                    if sub_name.starts_with(&format!("{}_", top_name)) || sub_name.contains(':') {
+                        let bare = bare.to_string();
+                        if let SexpNode::List(sc) = sub {
+                            for c in sc.iter_mut().skip(1) {
+                                if let SexpNode::Str(s) = c {
+                                    *s = bare;
+                                    renamed += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    renamed
 }
 
 #[cfg(test)]

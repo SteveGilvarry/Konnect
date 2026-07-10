@@ -10,7 +10,7 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolCon
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
-    schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
+    schematic::{extract_symbol_instances, pin_endpoint, read_schematic},
     writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
 };
 use serde_json::json;
@@ -771,28 +771,20 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = lib_syms
+    let lib_pins = konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+    let t = inst.pin_transform();
+    let pins: Vec<serde_json::Value> = lib_pins
         .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
-
-    let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-        let lib_pins = extract_lib_pins(sym);
-        let t = inst.pin_transform();
-        lib_pins
-            .iter()
-            .map(|p| {
-                let (sx, sy) = pin_endpoint(p, t);
-                json!({
-                    "number": p.number,
-                    "name": p.name,
-                    "x": sx,
-                    "y": sy
-                })
+        .map(|p| {
+            let (sx, sy) = pin_endpoint(p, t);
+            json!({
+                "number": p.number,
+                "name": p.name,
+                "x": sx,
+                "y": sy
             })
-            .collect()
-    } else {
-        Vec::new()
-    };
+        })
+        .collect();
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
@@ -831,21 +823,15 @@ async fn handle_batch_get_pin_locations(
                 Some(i) => i,
                 None => return json!({ "reference": reference, "error": "not found" }),
             };
-            let lib_sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
-            let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-                let t = inst.pin_transform();
-                extract_lib_pins(sym)
+            let t = inst.pin_transform();
+            let pins: Vec<serde_json::Value> =
+                konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id)
                     .iter()
                     .map(|p| {
                         let (sx, sy) = pin_endpoint(p, t);
                         json!({ "number": p.number, "name": p.name, "x": sx, "y": sy })
                     })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                    .collect();
             json!({ "reference": reference, "x": inst.x, "y": inst.y, "pins": pins })
         })
         .collect();
