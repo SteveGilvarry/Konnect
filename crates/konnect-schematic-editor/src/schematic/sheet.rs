@@ -170,6 +170,38 @@ fn default_stroke_fill() -> Vec<SexpNode> {
     ]
 }
 
+/// Build a Sheetname/Sheetfile property with explicit position and text
+/// effects. Without `(at ...)` and `(effects ...)` sub-nodes KiCAD renders
+/// sheet boxes with no visible name/file text (plots show blank rectangles).
+/// `justify_v` is "bottom" for the name above the box, "top" for the file
+/// path below it, matching KiCAD's own field autoplacement.
+pub fn positioned_sheet_property(
+    name: &str,
+    value: impl Into<String>,
+    x: f64,
+    y: f64,
+    justify_v: &str,
+) -> Property {
+    let mut p = Property::new(name, value);
+    p.sub_nodes = vec![
+        SexpNode::List(vec![
+            atom("at"),
+            atom(fmt_f64(x)),
+            atom(fmt_f64(y)),
+            atom("0"),
+        ]),
+        SexpNode::List(vec![
+            atom("effects"),
+            SexpNode::List(vec![
+                atom("font"),
+                SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+            ]),
+            SexpNode::List(vec![atom("justify"), atom("left"), atom(justify_v)]),
+        ]),
+    ];
+    p
+}
+
 impl Sheet {
     pub fn new(
         name: impl Into<String>,
@@ -186,8 +218,8 @@ impl Sheet {
             uuid: uuid::Uuid::new_v4().to_string(),
             fields_autoplaced: true,
             properties: vec![
-                Property::new("Sheetname", name),
-                Property::new("Sheetfile", file),
+                positioned_sheet_property("Sheetname", name, x, y - 0.7, "bottom"),
+                positioned_sheet_property("Sheetfile", file, x, y + height + 0.7, "top"),
             ],
             pins: vec![],
             instances: vec![],

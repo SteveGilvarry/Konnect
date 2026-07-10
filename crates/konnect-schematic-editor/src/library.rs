@@ -100,7 +100,11 @@ pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
 /// from `Parent_U_S` to `Child_U_S` to match the top-level name.
 pub fn resolve_lib_symbol_node_flattened(lib_id: &str) -> Option<SexpNode> {
     let child = resolve_lib_symbol_node(lib_id)?;
-    let Some(extends) = child.find("extends").and_then(|e| e.value()).map(str::to_owned) else {
+    let Some(extends) = child
+        .find("extends")
+        .and_then(|e| e.value())
+        .map(str::to_owned)
+    else {
         return Some(child); // not derived
     };
 

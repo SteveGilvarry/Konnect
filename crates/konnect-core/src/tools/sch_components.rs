@@ -283,7 +283,7 @@ async fn handle_create_schematic(
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
     // Build a minimal valid schematic and save via cse's atomic writer
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
+    let template = "(kicad_sch\n\t(version 20260306)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
     write_atomic(&path, template)?;

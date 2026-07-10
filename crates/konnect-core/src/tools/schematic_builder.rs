@@ -54,7 +54,7 @@ impl SchematicBuilder {
         let uuid = konnect_sexp::writer::new_uuid();
         SchematicBuilder {
             header: format!(
-                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")",
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")",
                 uuid
             ),
             lib_symbols: Vec::new(),
@@ -396,7 +396,7 @@ mod tests {
         let builder = SchematicBuilder::new();
         let output = builder.to_string();
         assert!(output.starts_with("(kicad_sch"));
-        assert!(output.contains("(version 20250610)"));
+        assert!(output.contains("(version 20260306)"));
         assert!(output.contains("(lib_symbols"));
         assert!(output.ends_with(")\n"));
     }

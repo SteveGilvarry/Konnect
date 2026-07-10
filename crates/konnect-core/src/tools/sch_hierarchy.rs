@@ -178,7 +178,7 @@ fn parent_dir(sch_path: &Path) -> PathBuf {
 }
 
 fn create_blank_schematic(path: &Path) -> anyhow::Result<()> {
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
+    let template = "(kicad_sch\n\t(version 20260306)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
     konnect_sexp::writer::write_atomic(path, template)?;
     // Round-trip through cse so the file is normalised to its writer's format,
     // matching the existing `create_schematic` tool's behavior.
@@ -749,6 +749,14 @@ fn repair_walk(
     let mut sym_count = 0usize;
     let mut sheet_count = 0usize;
 
+    // Upgrade files stamped with an older format version to the KiCad 10
+    // release version (matches eeschema's SEXPR_SCHEMATIC_FILE_VERSION so the
+    // GUI stops reporting "created by an older version of KiCad").
+    const KICAD10_SCH_VERSION: u32 = 20260306;
+    if sch.version.unwrap_or(0) < KICAD10_SCH_VERSION {
+        sch.version = Some(KICAD10_SCH_VERSION);
+    }
+
     // Older Konnect builds embedded unit sub-symbols with a "Lib:" prefix
     // ("Device:R_0_1"), which makes KiCAD reject the whole file. Strip the
     // prefix from nested unit names so they match KiCAD's expected format.
@@ -773,6 +781,32 @@ fn repair_walk(
         sheet.instances.clear();
         sheet.set_page(project_name, prefix, &page);
         sheet_count += 1;
+        // Sheetname/Sheetfile written without (at ...)/(effects ...) render as
+        // blank boxes — give them KiCAD-style positions if they lack one.
+        let (sx, sy, sh) = (sheet.at.x, sheet.at.y, sheet.height);
+        for prop in sheet.properties.iter_mut() {
+            let has_at = prop.sub_nodes.iter().any(|n| n.tag() == Some("at"));
+            if !has_at {
+                let fixed = match prop.name.as_str() {
+                    "Sheetname" => cse::positioned_sheet_property(
+                        "Sheetname",
+                        prop.value.clone(),
+                        sx,
+                        sy - 0.7,
+                        "bottom",
+                    ),
+                    "Sheetfile" => cse::positioned_sheet_property(
+                        "Sheetfile",
+                        prop.value.clone(),
+                        sx,
+                        sy + sh + 0.7,
+                        "top",
+                    ),
+                    _ => continue,
+                };
+                prop.sub_nodes = fixed.sub_nodes;
+            }
+        }
         children.push((sheet.uuid.clone(), sheet.file().to_string()));
     }
 

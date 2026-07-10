@@ -383,7 +383,7 @@ fn blank_kicad_pro(name: &str) -> String {
 }
 
 fn blank_kicad_sch() -> &'static str {
-    "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n"
+    "(kicad_sch\n\t(version 20260306)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n"
 }
 
 fn blank_kicad_pcb() -> &'static str {

@@ -10,8 +10,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
     schematic::{
-        extract_symbol_instances, extract_wires, find_t_junctions, format_junction,
-        format_wire, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
+        pin_endpoint, read_schematic,
     },
     writer::{apply_edits, find_block_with_leading_whitespace, write_atomic, SexpEdit},
 };
