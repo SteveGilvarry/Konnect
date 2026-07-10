@@ -762,6 +762,27 @@ fn repair_walk(
     // prefix from nested unit names so they match KiCAD's expected format.
     let renamed_units = fix_embedded_unit_names(&mut sch);
 
+    // Global/hierarchical labels written without (effects (justify ...)) render
+    // with their body extending right of the anchor regardless of rotation,
+    // covering whatever they point at. Retrofit rotation-appropriate justify.
+    let mut fixed_labels = 0usize;
+    for gl in sch.global_labels.iter_mut() {
+        if gl.effects.is_none() {
+            gl.effects = Some(cse::label_effects_for_rotation(
+                gl.at.rotation.unwrap_or(0.0),
+            ));
+            fixed_labels += 1;
+        }
+    }
+    for hl in sch.hierarchical_labels.iter_mut() {
+        if hl.effects.is_none() {
+            hl.effects = Some(cse::label_effects_for_rotation(
+                hl.at.rotation.unwrap_or(0.0),
+            ));
+            fixed_labels += 1;
+        }
+    }
+
     for sym in sch.symbols.iter_mut() {
         let reference = sym.reference().unwrap_or("").to_string();
         let unit = sym.unit;
@@ -810,7 +831,7 @@ fn repair_walk(
         children.push((sheet.uuid.clone(), sheet.file().to_string()));
     }
 
-    if sym_count > 0 || sheet_count > 0 || renamed_units > 0 {
+    if sym_count > 0 || sheet_count > 0 || renamed_units > 0 || fixed_labels > 0 {
         sch.overwrite()?;
     }
     *repaired_symbols += sym_count;

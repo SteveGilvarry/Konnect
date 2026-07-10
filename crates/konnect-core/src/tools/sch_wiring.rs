@@ -676,6 +676,7 @@ async fn handle_add_net_label(
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.at.rotation = Some(rotation);
+                gl.effects = Some(cse::label_effects_for_rotation(rotation));
             }
         }
         "hierarchical_label" => {
@@ -684,6 +685,7 @@ async fn handle_add_net_label(
             let idx = sch.hierarchical_labels.len() - 1;
             if let Some(hl) = sch.hierarchical_labels.get_mut(idx) {
                 hl.at.rotation = Some(rotation);
+                hl.effects = Some(cse::label_effects_for_rotation(rotation));
             }
         }
         _ => {

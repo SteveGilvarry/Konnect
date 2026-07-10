@@ -698,7 +698,18 @@ async fn register_in_lib_table(
     let content = if table_path.exists() {
         tokio::fs::read_to_string(table_path).await?
     } else {
-        "(fp_lib_table\n  (version 7)\n)\n".to_string()
+        // Header token must match the table kind — KiCAD refuses to load a
+        // sym-lib-table whose root token says fp_lib_table.
+        let header = if table_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with("sym-lib-table"))
+        {
+            "sym_lib_table"
+        } else {
+            "fp_lib_table"
+        };
+        format!("({}\n  (version 7)\n)\n", header)
     };
 
     // Check if nickname already registered

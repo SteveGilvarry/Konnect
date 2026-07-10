@@ -715,8 +715,13 @@ async fn handle_add_schematic_text(
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let uuid = new_uuid();
 
-    // Escape quotes in text content
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    // Escape backslashes, quotes, and newlines - KiCAD's s-expression parser
+    // rejects raw newlines inside quoted strings ("unterminated delimited
+    // string"); multi-line text must use literal \n escapes.
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \

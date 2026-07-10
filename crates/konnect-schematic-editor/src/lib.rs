@@ -6,8 +6,8 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use schematic::label::{
-    GlobalLabel, GlobalLabelCollection, HierarchicalLabel, HierarchicalLabelCollection, Label,
-    LabelCollection,
+    label_effects_for_rotation, GlobalLabel, GlobalLabelCollection, HierarchicalLabel,
+    HierarchicalLabelCollection, Label, LabelCollection,
 };
 pub use schematic::misc::{Junction, NoConnect, Text};
 pub use schematic::sheet::{

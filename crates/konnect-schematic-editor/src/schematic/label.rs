@@ -68,6 +68,27 @@ impl Label {
     }
 }
 
+/// Build default text effects for a global/hierarchical label at the given
+/// rotation. KiCAD justifies label text relative to the anchor; without an
+/// explicit `(justify ...)` node a rotation-180 label still renders with its
+/// body extending to the RIGHT of the anchor, covering the wire or symbol it
+/// points at. 0/90 degrees justify left, 180/270 justify right.
+pub fn label_effects_for_rotation(rotation: f64) -> crate::types::Effects {
+    let justify = if (rotation - 180.0).abs() < 0.1 || (rotation - 270.0).abs() < 0.1 {
+        "right"
+    } else {
+        "left"
+    };
+    crate::types::Effects(SexpNode::List(vec![
+        atom("effects"),
+        SexpNode::List(vec![
+            atom("font"),
+            SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+        ]),
+        SexpNode::List(vec![atom("justify"), atom(justify)]),
+    ]))
+}
+
 // ---- GlobalLabel ------------------------------------------------------------
 
 #[derive(Debug, Clone)]
