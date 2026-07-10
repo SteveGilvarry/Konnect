@@ -248,6 +248,17 @@ fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
 pub fn find_symbol_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
+    // Extra project/user library directories (colon-separated), searched first
+    // so project libraries can shadow stock symbols.
+    if let Ok(extra) = std::env::var("KONNECT_SYMBOL_PATH") {
+        for part in extra.split(':') {
+            let p = PathBuf::from(part);
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+
     if let Ok(dir) = std::env::var("KICAD10_SYMBOL_DIR") {
         let p = PathBuf::from(&dir);
         if p.is_dir() {
