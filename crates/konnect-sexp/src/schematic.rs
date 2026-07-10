@@ -237,7 +237,55 @@ pub struct LibPin {
 }
 
 /// Parse pins from a library symbol definition node.
+///
+/// KiCad library symbols keep pins inside nested unit sub-symbols
+/// (e.g. `symbol "R_1_1"` inside `symbol "Device:R"`), so this recurses
+/// into child `symbol` nodes in addition to scanning direct `pin` children.
 pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
+    let mut pins = extract_direct_pins(sym_node);
+    for sub in sym_node.find_all("symbol") {
+        pins.extend(extract_lib_pins(sub));
+    }
+    pins
+}
+
+/// Resolve the pins for `lib_id` from a schematic's `lib_symbols` entries,
+/// following `extends` chains (derived symbols keep their pins on the parent,
+/// which KiCad embeds alongside the child). The parent name inside `extends`
+/// is unqualified; embedded parents keep the child's `Lib:` prefix.
+pub fn resolve_lib_pins(lib_syms: &[&SexpNode], lib_id: &str) -> Vec<LibPin> {
+    let mut current = lib_id.to_string();
+    for _ in 0..8 {
+        let Some(sym) = lib_syms
+            .iter()
+            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(current.as_str()))
+        else {
+            return Vec::new();
+        };
+        let pins = extract_lib_pins(sym);
+        if !pins.is_empty() {
+            return pins;
+        }
+        let Some(parent) = sym
+            .find("extends")
+            .and_then(|e| e.get(1))
+            .and_then(|s| s.as_str())
+        else {
+            return Vec::new();
+        };
+        current = if parent.contains(':') {
+            parent.to_string()
+        } else {
+            match current.split_once(':') {
+                Some((lib, _)) => format!("{lib}:{parent}"),
+                None => parent.to_string(),
+            }
+        };
+    }
+    Vec::new()
+}
+
+fn extract_direct_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     sym_node
         .find_all("pin")
         .iter()
@@ -273,12 +321,14 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
 
 /// Compute the schematic-space pin endpoint (where wires connect) for a lib pin
 /// given a component's placement transform.
+///
+/// In KiCAD's symbol format the pin's `(at X Y ANGLE)` position IS the
+/// electrical connection point (the free tip); the pin line extends from
+/// there toward the symbol body along ANGLE for `length` mm. Adding the
+/// length here would return the body end, which is off-grid and
+/// unconnectable for stock library symbols.
 pub fn pin_endpoint(pin: &LibPin, t: PinTransform) -> (f64, f64) {
-    // The wire-connection point is at pin_origin + length in pin direction
-    let angle_rad = pin.rotation.to_radians();
-    let tip_x = pin.local_x + pin.length * angle_rad.cos();
-    let tip_y = pin.local_y + pin.length * angle_rad.sin();
-    transform_pin(tip_x, tip_y, t)
+    transform_pin(pin.local_x, pin.local_y, t)
 }
 
 // ─── T-Junction detection ─────────────────────────────────────────────────────
