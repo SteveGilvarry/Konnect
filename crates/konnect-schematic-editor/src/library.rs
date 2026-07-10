@@ -48,11 +48,10 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             );
                         }
                     }
-                    // Also fix sub-symbol names: (symbol "Name_0_1") → (symbol "Lib:Name_0_1")
-                    // These are unit/variant sub-symbols that KiCAD prefixes in lib_symbols
-                    let sub_prefix = format!("(symbol \"{}_", symbol_name);
-                    let new_sub_prefix = format!("(symbol \"{}:{}_", library_name, symbol_name);
-                    renamed = renamed.replace(&sub_prefix, &new_sub_prefix);
+                    // Unit/variant sub-symbol names ("Name_0_1") must stay
+                    // UNQUALIFIED: KiCAD prefixes only the top-level name in a
+                    // schematic's lib_symbols table and rejects the whole file
+                    // if nested unit names carry a "Lib:" prefix.
                     return Some(renamed);
                 }
             }
@@ -78,9 +77,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             );
                         }
                     }
-                    let sub_prefix = format!("(symbol \"{}_", symbol_name);
-                    let new_sub_prefix = format!("(symbol \"{}:{}_", library_name, symbol_name);
-                    renamed = renamed.replace(&sub_prefix, &new_sub_prefix);
+                    // Unit sub-symbol names stay unqualified — see note above.
                     return Some(renamed);
                 }
             }
@@ -93,6 +90,76 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
 pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
     let raw = resolve_lib_symbol(lib_id)?;
     parser::parse(&raw).ok()
+}
+
+/// Resolve a lib_id to a parsed, self-contained SexpNode tree with any
+/// `extends` chain flattened, the way KiCAD's GUI embeds derived symbols:
+/// the child keeps its own name and `(property ...)` fields, and inherits
+/// everything else (graphics, pins, unit sub-symbols, pin_names/pin_numbers,
+/// body attributes) from its resolved parent. Unit sub-symbols are renamed
+/// from `Parent_U_S` to `Child_U_S` to match the top-level name.
+pub fn resolve_lib_symbol_node_flattened(lib_id: &str) -> Option<SexpNode> {
+    let child = resolve_lib_symbol_node(lib_id)?;
+    let Some(extends) = child.find("extends").and_then(|e| e.value()).map(str::to_owned) else {
+        return Some(child); // not derived
+    };
+
+    // resolve_lib_symbol qualifies extends with the child's library prefix.
+    let parent_lib_id = if extends.contains(':') {
+        extends
+    } else {
+        let lib = lib_id.split(':').next().unwrap_or("");
+        format!("{}:{}", lib, extends)
+    };
+    // Recurse: parents can themselves be derived.
+    let parent = resolve_lib_symbol_node_flattened(&parent_lib_id)?;
+
+    let child_base = lib_id.split(':').nth(1).unwrap_or(lib_id);
+    let parent_base = parent_lib_id.split(':').nth(1).unwrap_or(&parent_lib_id);
+
+    // Start from the parent's full definition.
+    let SexpNode::List(parent_children) = parent else {
+        return Some(child);
+    };
+    let mut merged: Vec<SexpNode> = Vec::with_capacity(parent_children.len());
+    for node in parent_children {
+        match node {
+            // Drop the parent's name and properties; the child supplies both.
+            SexpNode::Str(_) => merged.push(SexpNode::Str(lib_id.to_owned())),
+            ref n if n.tag() == Some("property") => {}
+            // Rename unit sub-symbols Parent_U_S -> Child_U_S.
+            SexpNode::List(mut sub) if sub.first().and_then(|t| t.text()) == Some("symbol") => {
+                for c in sub.iter_mut().skip(1) {
+                    if let SexpNode::Str(name) = c {
+                        if let Some(rest) = name.strip_prefix(&format!("{}_", parent_base)) {
+                            *name = format!("{}_{}", child_base, rest);
+                        }
+                        break;
+                    }
+                }
+                merged.push(SexpNode::List(sub));
+            }
+            other => merged.push(other),
+        }
+    }
+
+    // Insert the child's properties after the header attributes (i.e. before
+    // the first unit sub-symbol), preserving KiCAD's usual ordering.
+    let child_props: Vec<SexpNode> = child
+        .args()
+        .iter()
+        .filter(|n| n.tag() == Some("property"))
+        .cloned()
+        .collect();
+    let insert_at = merged
+        .iter()
+        .position(|n| n.tag() == Some("symbol"))
+        .unwrap_or(merged.len());
+    for (i, prop) in child_props.into_iter().enumerate() {
+        merged.insert(insert_at + i, prop);
+    }
+
+    Some(SexpNode::List(merged))
 }
 
 /// Ensure a library symbol definition is present in the schematic's lib_symbols section.
@@ -114,27 +181,12 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) {
         return;
     }
 
-    // Resolve the symbol's raw text to check for (extends "ParentName")
-    let sym_raw = match resolve_lib_symbol(lib_id) {
-        Some(r) => r,
-        None => return,
-    };
-
-    // Check for (extends "ParentName") and resolve the parent too.
-    // Note: sym_raw already has prefixed names (e.g. extends "MCU_Microchip_ATmega:ATmega48PV-10A")
-    // so we use the prefixed parent name directly as the lib_id for the recursive call.
-    if let Some(extends_pos) = sym_raw.find("(extends \"") {
-        let after = &sym_raw[extends_pos + 10..];
-        if let Some(end) = after.find('"') {
-            let parent_lib_id = &after[..end]; // Already has library prefix
-            if parent_lib_id.contains(':') {
-                ensure_lib_symbol(schematic, parent_lib_id);
-            }
-        }
-    }
-
-    // Now resolve and embed the symbol itself
-    let sym_node = match resolve_lib_symbol_node(lib_id) {
+    // Resolve and embed the symbol. Derived symbols (`extends`) are flattened
+    // into self-contained definitions first: KiCAD's schematic loader does not
+    // resolve `extends` inside a lib_symbols table (the GUI flattens derived
+    // symbols when it embeds them), so an extends-only embed renders with no
+    // body and fails lib_symbol_mismatch checks.
+    let sym_node = match resolve_lib_symbol_node_flattened(lib_id) {
         Some(n) => n,
         None => return,
     };

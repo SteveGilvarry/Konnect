@@ -171,6 +171,13 @@ impl Symbol {
 
     // ---- instance paths -------------------------------------------------------
 
+    /// Remove every `(instances ...)` entry from this symbol. Use together
+    /// with `set_instance_path` to rewrite stale or malformed instance data
+    /// (e.g. paths that don't start at the root schematic's UUID).
+    pub fn clear_instances(&mut self) {
+        self.raw_sub_nodes.retain(|n| n.tag() != Some("instances"));
+    }
+
     /// Ensure this symbol carries an `(instances (project "name" (path "path"
     /// (reference "ref") (unit N))))` entry. Updates the entry if one already
     /// exists for this project+path, otherwise appends it (creating the
