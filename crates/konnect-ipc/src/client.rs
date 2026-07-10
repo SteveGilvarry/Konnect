@@ -60,6 +60,22 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// Probe KiCAD's default API socket location for the current platform and
+/// return an `ipc://` address if a socket file actually exists there.
+/// KiCAD (9/10) defaults to `/tmp/kicad/api.sock` on Unix-likes; on Windows
+/// the default transport is a named pipe whose availability can't be checked
+/// by a filesystem probe, so no fallback is attempted there.
+fn default_socket_path() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let candidate = std::path::Path::new("/tmp/kicad/api.sock");
+        if candidate.exists() {
+            return Some(format!("ipc://{}", candidate.display()));
+        }
+    }
+    None
+}
+
 pub struct KiCadIpcClient {
     socket_path: String,
     client_name: String,
@@ -67,11 +83,20 @@ pub struct KiCadIpcClient {
 
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
-    /// If empty, tries KICAD_API_SOCKET environment variable.
+    /// If empty, tries the KICAD_API_SOCKET environment variable, then falls
+    /// back to KiCAD's default socket location if a live socket exists there.
+    /// The env var is only set when KiCAD itself launches the plugin —
+    /// standalone MCP servers (Claude Code and other AI clients) never see it,
+    /// so without the default-path probe every standalone session requires
+    /// manual socket configuration (issue #18).
     pub fn new(socket_path: impl Into<String>) -> Self {
         let path = socket_path.into();
         let effective_path = if path.is_empty() {
-            std::env::var("KICAD_API_SOCKET").unwrap_or_default()
+            std::env::var("KICAD_API_SOCKET")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(default_socket_path)
+                .unwrap_or_default()
         } else {
             path
         };
@@ -89,9 +114,11 @@ impl KiCadIpcClient {
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
             anyhow::bail!(
-                "KiCAD IPC socket path not configured. \
-                 Either launch this plugin from KiCAD (sets KICAD_API_SOCKET), \
-                 or set the ipc_socket_path in settings."
+                "KiCAD IPC socket path not configured and no live socket found at \
+                 the default location. Start KiCAD with the IPC API enabled \
+                 (Preferences > Plugins > Enable IPC API), or set `ipc_address` in \
+                 Konnect's config (the ipc:// address shown in that preferences \
+                 page), or launch this plugin from KiCAD (sets KICAD_API_SOCKET)."
             );
         }
 
