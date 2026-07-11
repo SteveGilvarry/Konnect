@@ -1192,7 +1192,7 @@ async fn handle_connect_to_net(
         let mut found = None;
         'outer: for inst in &instances {
             let t = inst.pin_transform();
-            for pin in konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id) {
+            for pin in konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit) {
                 let (px, py) = pin_endpoint(&pin, t);
                 if points_coincident(px, py, pin_x, pin_y, 0.02) {
                     let (bx, by) = konnect_sexp::schematic::pin_body_vector(&pin, t);
@@ -1366,7 +1366,7 @@ fn resolve_pin_endpoint(
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
 
-    let pins = konnect_sexp::schematic::resolve_lib_pins(lib_syms, &inst.lib_id);
+    let pins = konnect_sexp::schematic::resolve_lib_pins_for_unit(lib_syms, &inst.lib_id, inst.unit);
     let lib_pin = pins
         .iter()
         .find(|p| p.number == pin_number)

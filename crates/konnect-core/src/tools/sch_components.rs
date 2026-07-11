@@ -42,7 +42,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "reference": { "type": "string", "description": "Optional override for reference designator" },
-                    "value": { "type": "string", "description": "Optional override for value field" }
+                    "value": { "type": "string", "description": "Optional override for value field" },
+                    "unit": { "type": "integer", "description": "Unit number for multi-unit symbols (e.g. gate B of a quad buffer = 2). Default 1. Place each unit as its own call with the same reference.", "default": 1 }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
             }),
@@ -351,6 +352,7 @@ async fn handle_add_schematic_component(
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
+    let unit = args["unit"].as_u64().unwrap_or(1) as u32;
 
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
@@ -367,6 +369,7 @@ async fn handle_add_schematic_component(
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(&lib_id, x, y);
     sym.at.rotation = Some(rotation);
+    sym.unit = unit;
 
     // Helper: build an effects sub-node  (font (size 1.27 1.27))  with optional (hide yes)
     let effects_node = |hide: bool| -> cse::sexp::SexpNode {
@@ -439,7 +442,10 @@ async fn handle_add_schematic_component(
                     cse::sexp::atom("reference"),
                     cse::sexp::qstr(ref_str),
                 ]),
-                cse::sexp::SexpNode::List(vec![cse::sexp::atom("unit"), cse::sexp::atom("1")]),
+                cse::sexp::SexpNode::List(vec![
+                    cse::sexp::atom("unit"),
+                    cse::sexp::atom(unit.to_string()),
+                ]),
             ]),
         ]),
     ]);
@@ -644,7 +650,7 @@ async fn handle_autoplace_fields(
             _ => {}
         }
         let pins =
-            konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+            konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit);
         if pins.is_empty() {
             errors.push(format!("{}: no pins resolved", inst.reference));
             continue;
@@ -926,7 +932,7 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_pins = konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+    let lib_pins = konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit);
     let t = inst.pin_transform();
     let pins: Vec<serde_json::Value> = lib_pins
         .iter()
@@ -980,7 +986,7 @@ async fn handle_batch_get_pin_locations(
             };
             let t = inst.pin_transform();
             let pins: Vec<serde_json::Value> =
-                konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id)
+                konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit)
                     .iter()
                     .map(|p| {
                         let (sx, sy) = pin_endpoint(p, t);

@@ -157,6 +157,8 @@ pub struct SymbolInstance {
     pub mirror_x: bool,
     pub mirror_y: bool,
     pub uuid: Option<String>,
+    /// Unit number for multi-unit symbols (1 for single-unit parts).
+    pub unit: u32,
 }
 
 impl SymbolInstance {
@@ -207,6 +209,12 @@ pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
                 .and_then(|u| u.as_str())
                 .map(String::from);
 
+            let unit = node
+                .find("unit")
+                .and_then(|u| u.get_f64(1))
+                .map(|v| v as u32)
+                .unwrap_or(1);
+
             Some(SymbolInstance {
                 reference: prop("Reference"),
                 value: prop("Value"),
@@ -218,6 +226,7 @@ pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
                 mirror_x,
                 mirror_y,
                 uuid,
+                unit,
             })
         })
         .collect()
@@ -249,11 +258,46 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     pins
 }
 
+/// Like `extract_lib_pins`, but only pins belonging to `unit` (plus unit 0,
+/// which KiCad uses for pins common to all units, e.g. power pins). Unit
+/// sub-symbols are named `<name>_<unit>_<bodystyle>`.
+pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
+    let mut pins = extract_direct_pins(sym_node);
+    for sub in sym_node.find_all("symbol") {
+        let sub_unit = sub
+            .get(1)
+            .and_then(|c| c.as_str())
+            .and_then(|name| {
+                let mut it = name.rsplitn(3, '_');
+                let _bodystyle = it.next()?;
+                it.next()?.parse::<u32>().ok()
+            });
+        match sub_unit {
+            Some(u) if u == 0 || u == unit => pins.extend(extract_lib_pins_for_unit(sub, unit)),
+            Some(_) => {}
+            // Not a recognisable unit name: keep recursing rather than drop pins.
+            None => pins.extend(extract_lib_pins_for_unit(sub, unit)),
+        }
+    }
+    pins
+}
+
 /// Resolve the pins for `lib_id` from a schematic's `lib_symbols` entries,
 /// following `extends` chains (derived symbols keep their pins on the parent,
 /// which KiCad embeds alongside the child). The parent name inside `extends`
 /// is unqualified; embedded parents keep the child's `Lib:` prefix.
 pub fn resolve_lib_pins(lib_syms: &[&SexpNode], lib_id: &str) -> Vec<LibPin> {
+    resolve_lib_pins_impl(lib_syms, lib_id, None)
+}
+
+/// Unit-aware variant of `resolve_lib_pins`: only pins of `unit` (plus the
+/// shared unit 0). For single-unit symbols this returns the same set as
+/// `resolve_lib_pins`.
+pub fn resolve_lib_pins_for_unit(lib_syms: &[&SexpNode], lib_id: &str, unit: u32) -> Vec<LibPin> {
+    resolve_lib_pins_impl(lib_syms, lib_id, Some(unit))
+}
+
+fn resolve_lib_pins_impl(lib_syms: &[&SexpNode], lib_id: &str, unit: Option<u32>) -> Vec<LibPin> {
     let mut current = lib_id.to_string();
     for _ in 0..8 {
         let Some(sym) = lib_syms
@@ -262,7 +306,10 @@ pub fn resolve_lib_pins(lib_syms: &[&SexpNode], lib_id: &str) -> Vec<LibPin> {
         else {
             return Vec::new();
         };
-        let pins = extract_lib_pins(sym);
+        let pins = match unit {
+            Some(u) => extract_lib_pins_for_unit(sym, u),
+            None => extract_lib_pins(sym),
+        };
         if !pins.is_empty() {
             return pins;
         }

@@ -838,7 +838,7 @@ async fn handle_check_overlaps(
             continue; // power symbols: tiny, labels legitimately sit close
         }
         let t = inst.pin_transform();
-        let pins = konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+        let pins = konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit);
         if pins.is_empty() {
             continue;
         }
