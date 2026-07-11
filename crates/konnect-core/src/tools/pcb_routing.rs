@@ -1,43 +1,20 @@
 //! `pcb_routing` toolset — traces, vias, copper pours, nets, netclasses, and diff pairs.
 //!
-//! Routing operations use the KiCAD IPC API; `add_net`, `create_netclass`, and
-//! `add_copper_pour` use S-expression file manipulation.
+//! Routing tools follow the PR-#5 pattern: KiCAD IPC first, file fallback
+//! when no IPC transport exists, `source: "ipc" | "file"` in every response.
+//! Write tools refuse the file fallback when a live session is reachable but
+//! the IPC call failed (see `pcb_ipc`). `add_net`, `add_copper_pour`,
+//! `create_netclass`, and `assign_net_to_class` remain file-only (the KiCAD
+//! IPC API exposes no net/netclass mutation commands) and report
+//! `source: "file"` explicitly.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::pcb_file as pf;
+use crate::tools::pcb_ipc::{ipc_write_refused, try_ipc, IpcAttempt};
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
-use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{apply_edits, new_uuid, write_atomic, SexpEdit};
 use serde_json::json;
-
-// ─── IPC helper ───────────────────────────────────────────────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || f(&KiCadIpcClient::new(&addr))).await {
-        Ok(Ok(r)) => Ok(Ok(r)),
-        Ok(Err(e)) => Ok(Err(e.to_string())),
-        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
-    }
-}
-
-macro_rules! ipc {
-    ($ctx:expr, |$c:ident| $body:expr) => {{
-        let addr = $ctx.config.ipc_address.clone();
-        match with_ipc(addr, move |$c| $body).await? {
-            Ok(v) => v,
-            Err(msg) => {
-                return Ok(CallToolResult::error(format!(
-                    "KiCAD must be running with the board loaded (IPC error: {})",
-                    msg
-                )))
-            }
-        }
-    }};
-}
 
 // ─── S-expression helpers ─────────────────────────────────────────────────────
 
@@ -63,16 +40,34 @@ fn format_zone(
 }
 
 fn find_net_id(content: &str, net_name: &str) -> i32 {
+    // Match ` "<name>")` and read the number between the preceding `(net `
+    // and the match. NOTE: `before` ends exactly at the space before the
+    // quoted name, so the number runs to the END of `before` — the previous
+    // implementation searched for a trailing space that never exists and
+    // always parsed an empty string (net id 0 for every net).
     let search = format!(r#" "{net_name}")"#);
     if let Some(pos) = content.find(&search) {
         let before = &content[..pos];
-        let net_pos = before.rfind("(net ").unwrap_or(0);
-        let num_str = &before[net_pos + 5..];
-        let num_end = num_str.find(' ').unwrap_or(0);
-        num_str[..num_end].parse().unwrap_or(0)
+        match before.rfind("(net ") {
+            Some(net_pos) => before[net_pos + 5..].trim().parse().unwrap_or(0),
+            None => 0,
+        }
     } else {
         0
     }
+}
+
+/// Resolve a net name to its file net id, erroring (with a hint) when the net
+/// doesn't exist — inserting copper with a wrong net id corrupts connectivity.
+fn require_file_net_id(content: &str, net_name: &str) -> Result<i32, CallToolResult> {
+    let id = find_net_id(content, net_name);
+    if id == 0 && !net_name.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "Net '{}' not found in the board file. Add it first with add_net.",
+            net_name
+        )));
+    }
+    Ok(id)
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -81,7 +76,8 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "add_net",
-            "Add a new net entry to the PCB file (S-expression insert, no KiCAD IPC required).",
+            "Add a new net entry to the PCB file (S-expression insert, file-based only — the \
+             KiCAD IPC API has no net-creation command).",
             json!({
                 "type": "object",
                 "properties": {
@@ -94,7 +90,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_trace",
-            "Route a trace segment between two points on a copper layer via KiCAD IPC.",
+            "Route a trace segment between two points on a copper layer (KiCAD IPC first, \
+             file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -111,7 +108,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_pad_to_pad",
-            "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
+            "Route a direct trace between two pads of named components (L-bend routing; KiCAD \
+             IPC first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -130,7 +128,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_via",
-            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
+            "Add a through-hole via at a given position and assign it to a net (KiCAD IPC \
+             first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -147,7 +146,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_copper_pour",
-            "Add a copper fill zone polygon on a layer/net via S-expression file insert.",
+            "Add a copper fill zone polygon on a layer/net via S-expression file insert \
+             (file-based only — zone protobufs were deferred upstream).",
             json!({
                 "type": "object",
                 "properties": {
@@ -167,7 +167,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_trace",
-            "Delete a trace segment identified by its UUID via KiCAD IPC.",
+            "Delete a trace segment (or via/arc) identified by its UUID (KiCAD IPC first, \
+             file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -180,7 +181,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "query_traces",
-            "List trace segments on the board, optionally filtered by net and/or layer.",
+            "List trace segments on the board, optionally filtered by net and/or layer \
+             (KiCAD IPC first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -194,7 +196,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_nets_list",
-            "Return all nets defined on the PCB via KiCAD IPC.",
+            "Return all nets defined on the PCB (KiCAD IPC first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -206,7 +208,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "modify_trace",
-            "Modify a trace segment by deleting and re-adding it with new parameters.",
+            "Modify a trace segment by deleting and re-adding it with new parameters (KiCAD \
+             IPC first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -224,7 +227,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "create_netclass",
-            "Add a netclass definition to the board's design rules (S-expression file insert).",
+            "Add a netclass definition to the board's design rules (S-expression file insert, \
+             file-based only — the KiCAD IPC API has no netclass mutation command).",
             json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +245,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "assign_net_to_class",
-            "Assign a net to an existing netclass in the PCB file (S-expression edit).",
+            "Assign a net to an existing netclass in the PCB file (S-expression edit, \
+             file-based only — the KiCAD IPC API has no netclass mutation command).",
             json!({
                 "type": "object",
                 "properties": {
@@ -255,7 +260,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_differential_pair",
-            "Route a differential pair (two parallel traces with a specified gap).",
+            "Route a differential pair (two parallel traces with a specified gap; KiCAD IPC \
+             first, file fallback).",
             json!({
                 "type": "object",
                 "properties": {
@@ -291,13 +297,11 @@ async fn handle_add_net(
     // Count existing nets to determine next net ID
     let net_id = content.matches("(net ").count() as i32;
     let net_sexp = format!("\n  (net {net_id} \"{net_name}\")");
-    // Insert before the last closing paren
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, net_sexp)]);
+    let new_content = pf::append_to_board(content, net_sexp);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(
-        &json!({ "net_id": net_id, "net_name": net_name }),
+        &json!({ "net_id": net_id, "net_name": net_name, "source": "file" }),
     ))
 }
 
@@ -305,6 +309,7 @@ async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -333,11 +338,35 @@ async fn handle_route_trace(
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| c
-        .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
+    match try_ipc(ctx, move |c| {
+        c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
+    })
+    .await?
+    {
+        IpcAttempt::Ok(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "net": net_name, "layer": layer, "width": width,
+                "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+                "source": "ipc"
+            })))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("route_trace", &msg)),
+        IpcAttempt::Unavailable(_) => {}
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let net_id = match require_file_net_id(&content, &net_name) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+    let segment = pf::format_segment(x1, y1, x2, y2, width, &layer, net_id);
+    let new_content = pf::append_to_board(content, segment);
+    write_atomic(&board_path, &new_content)?;
+
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+        "source": "file"
     })))
 }
 
@@ -369,43 +398,79 @@ async fn handle_route_pad_to_pad(
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     let width = args["width"].as_f64().unwrap_or(0.25);
 
-    // Look up pad positions from the PCB S-expression file
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = konnect_sexp::parser::parse_sexp(&content)?;
-
-    let pos1 = find_pad_board_position(&tree, &ref1, &pad1)?;
-    let pos2 = find_pad_board_position(&tree, &ref2, &pad2)?;
-
-    // Route an L-bend: horizontal first, then vertical
-    let (x1, y1) = pos1;
-    let (x2, y2) = pos2;
+    // IPC path: pad positions AND track creation both come from the live
+    // board, so a footprint moved over IPC routes correctly. (The old code
+    // read pad positions from the file while writing tracks over IPC — a
+    // split-brain within a single tool.)
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single segment
-        ipc!(ctx, |c| c
-            .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
-    } else {
-        // L-bend: horizontal then vertical
-        let mid_x = x2;
-        let mid_y = y1;
-        let net_a = net_name.clone();
-        let net_b = net_name.clone();
-        let layer_a = layer.clone();
-        let layer_b = layer.clone();
-        ipc!(ctx, |c| {
-            c.add_track(&net_a, &layer_a, width, x1, y1, mid_x, mid_y)?;
-            c.add_track(&net_b, &layer_b, width, mid_x, mid_y, x2, y2)?;
-            Ok(())
-        });
+    let (r1, p1, r2, p2) = (ref1.clone(), pad1.clone(), ref2.clone(), pad2.clone());
+    match try_ipc(ctx, move |c| {
+        let pad_pos = |reference: &str, pad_number: &str| -> anyhow::Result<(f64, f64)> {
+            let (fp, pads) = c
+                .get_footprint_pads(reference)?
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+            let pad = pads
+                .iter()
+                .find(|p| p.number == pad_number)
+                .ok_or_else(|| anyhow::anyhow!("Pad '{}' not found on '{}'", pad_number, reference))?;
+            let rad = fp.rotation.to_radians();
+            Ok((
+                fp.position.x + pad.position.x * rad.cos() - pad.position.y * rad.sin(),
+                fp.position.y + pad.position.x * rad.sin() + pad.position.y * rad.cos(),
+            ))
+        };
+        let (x1, y1) = pad_pos(&r1, &p1)?;
+        let (x2, y2) = pad_pos(&r2, &p2)?;
+        if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+            c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)?;
+        } else {
+            c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y1)?;
+            c.add_track(&net_ipc, &layer_ipc, width, x2, y1, x2, y2)?;
+        }
+        Ok(((x1, y1), (x2, y2)))
+    })
+    .await?
+    {
+        IpcAttempt::Ok(((x1, y1), (x2, y2))) => {
+            return Ok(CallToolResult::json(&json!({
+                "routed": true,
+                "net": net_name, "layer": layer, "width": width,
+                "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
+                "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
+                "source": "ipc"
+            })))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("route_pad_to_pad", &msg)),
+        IpcAttempt::Unavailable(_) => {}
     }
+
+    // File fallback: pad positions and segments both from/into the file.
+    let content = std::fs::read_to_string(&board_path)?;
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let (x1, y1) = find_pad_board_position(&tree, &ref1, &pad1)?;
+    let (x2, y2) = find_pad_board_position(&tree, &ref2, &pad2)?;
+    let net_id = match require_file_net_id(&content, &net_name) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+
+    let mut segments = String::new();
+    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+        segments.push_str(&pf::format_segment(x1, y1, x2, y2, width, &layer, net_id));
+    } else {
+        segments.push_str(&pf::format_segment(x1, y1, x2, y1, width, &layer, net_id));
+        segments.push_str(&pf::format_segment(x2, y1, x2, y2, width, &layer, net_id));
+    }
+    let new_content = pf::append_to_board(content, segments);
+    write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "routed": true,
         "net": net_name, "layer": layer, "width": width,
         "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
-        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 }
+        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
+        "source": "file"
     })))
 }
 
@@ -455,6 +520,7 @@ async fn handle_add_via(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -471,10 +537,30 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
-    Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
-    ))
+    match try_ipc(ctx, move |c| c.add_via(&net_ipc, x, y, drill, pad_size)).await? {
+        IpcAttempt::Ok(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size,
+                "source": "ipc"
+            })))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("add_via", &msg)),
+        IpcAttempt::Unavailable(_) => {}
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let net_id = match require_file_net_id(&content, &net_name) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+    let via = pf::format_via(x, y, pad_size, drill, net_id);
+    let new_content = pf::append_to_board(content, via);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size,
+        "source": "file"
+    })))
 }
 
 async fn handle_add_copper_pour(
@@ -508,12 +594,11 @@ async fn handle_add_copper_pour(
     let content = std::fs::read_to_string(&board_path)?;
     let net_id = find_net_id(&content, &net_name);
     let zone_s = format_zone(net_id, &net_name, &layer, clearance, min_w, &pts);
-    let close = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close, zone_s)]);
+    let new_content = pf::append_to_board(content, zone_s);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(
-        &json!({ "net": net_name, "layer": layer, "points": pts.len() }),
+        &json!({ "net": net_name, "layer": layer, "points": pts.len(), "source": "file" }),
     ))
 }
 
@@ -521,52 +606,157 @@ async fn handle_delete_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let uuid = match require_str(args, "uuid") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
 
     let uuid_ipc = uuid.clone();
-    ipc!(ctx, |c| c.delete_track(&uuid_ipc));
-    Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
+    match try_ipc(ctx, move |c| c.delete_track(&uuid_ipc)).await? {
+        IpcAttempt::Ok(()) => {
+            return Ok(CallToolResult::json(
+                &json!({ "deleted_uuid": uuid, "source": "ipc" }),
+            ))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("delete_trace", &msg)),
+        IpcAttempt::Unavailable(_) => {}
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let (s, _) = match pf::find_block_by_uuid(&content, &["segment", "via", "arc"], &uuid) {
+        Some(span) => span,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "No track segment, via, or arc with uuid '{}' found",
+                uuid
+            )))
+        }
+    };
+    let (ws, we) = konnect_sexp::writer::find_block_with_leading_whitespace(&content, s)
+        .ok_or_else(|| anyhow::anyhow!("Unbalanced track block"))?;
+    let new_content = apply_edits(content, vec![SexpEdit::delete(ws, we)]);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(
+        &json!({ "deleted_uuid": uuid, "source": "file" }),
+    ))
 }
 
 async fn handle_query_traces(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
 
-    let tracks = ipc!(ctx, |c| { c.get_tracks(net.as_deref(), layer.as_deref()) });
-
-    let items: Vec<serde_json::Value> = tracks
-        .iter()
-        .map(|t| {
-            json!({
-                "net": t.net_name, "layer": t.layer, "width": t.width,
-                "x1": t.start.x, "y1": t.start.y,
-                "x2": t.end.x,   "y2": t.end.y
+    let net_ipc = net.clone();
+    let layer_ipc = layer.clone();
+    if let IpcAttempt::Ok(tracks) = try_ipc(ctx, move |c| {
+        c.get_tracks(net_ipc.as_deref(), layer_ipc.as_deref())
+    })
+    .await?
+    {
+        let items: Vec<serde_json::Value> = tracks
+            .iter()
+            .map(|t| {
+                json!({
+                    "net": t.net_name, "layer": t.layer, "width": t.width,
+                    "x1": t.start.x, "y1": t.start.y,
+                    "x2": t.end.x,   "y2": t.end.y
+                })
             })
+            .collect();
+        return Ok(CallToolResult::json(
+            &json!({ "count": items.len(), "traces": items, "source": "ipc" }),
+        ));
+    }
+
+    // File fallback: parse (segment ...) blocks; net ids map to names via the
+    // top-level (net <id> "<name>") declarations.
+    let content = std::fs::read_to_string(&board_path)?;
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let net_names: std::collections::HashMap<i32, String> = tree
+        .find_all("net")
+        .iter()
+        .filter_map(|n| {
+            Some((
+                n.get_f64(1)? as i32,
+                n.get(2)?.as_str().unwrap_or("").to_string(),
+            ))
+        })
+        .collect();
+
+    let items: Vec<serde_json::Value> = tree
+        .find_all("segment")
+        .iter()
+        .filter_map(|seg| {
+            let start = seg.find("start")?;
+            let end = seg.find("end")?;
+            let seg_layer = seg
+                .find("layer")
+                .and_then(|l| l.get(1))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let net_id = seg.find("net").and_then(|n| n.get_f64(1)).unwrap_or(0.0) as i32;
+            let net_name = net_names.get(&net_id).cloned().unwrap_or_default();
+            if let Some(nf) = &net {
+                if &net_name != nf {
+                    return None;
+                }
+            }
+            if let Some(lf) = &layer {
+                if &seg_layer != lf {
+                    return None;
+                }
+            }
+            Some(json!({
+                "net": net_name, "layer": seg_layer,
+                "width": seg.find("width").and_then(|w| w.get_f64(1)).unwrap_or(0.0),
+                "x1": start.get_f64(1)?, "y1": start.get_f64(2)?,
+                "x2": end.get_f64(1)?,   "y2": end.get_f64(2)?,
+                "uuid": seg.find("uuid").and_then(|u| u.get(1)).and_then(|n| n.as_str()).unwrap_or("")
+            }))
         })
         .collect();
 
     Ok(CallToolResult::json(
-        &json!({ "count": items.len(), "traces": items }),
+        &json!({ "count": items.len(), "traces": items, "source": "file" }),
     ))
 }
 
 async fn handle_get_nets_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let nets = ipc!(ctx, |c| c.get_nets());
-    let items: Vec<serde_json::Value> = nets
+    let board_path = get_path(args, "board")?;
+
+    if let IpcAttempt::Ok(nets) = try_ipc(ctx, |c| c.get_nets()).await? {
+        let items: Vec<serde_json::Value> = nets
+            .iter()
+            .map(|n| json!({ "name": n.name, "netcode": n.netcode }))
+            .collect();
+        return Ok(CallToolResult::json(
+            &json!({ "count": items.len(), "nets": items, "source": "ipc" }),
+        ));
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let items: Vec<serde_json::Value> = tree
+        .find_all("net")
         .iter()
-        .map(|n| json!({ "name": n.name, "netcode": n.netcode }))
+        .filter_map(|n| {
+            Some(json!({
+                "name": n.get(2)?.as_str().unwrap_or(""),
+                "netcode": n.get_f64(1)? as i32
+            }))
+        })
         .collect();
     Ok(CallToolResult::json(
-        &json!({ "count": items.len(), "nets": items }),
+        &json!({ "count": items.len(), "nets": items, "source": "file" }),
     ))
 }
 
@@ -574,6 +764,7 @@ async fn handle_modify_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let uuid = match require_str(args, "uuid") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -607,14 +798,53 @@ async fn handle_modify_trace(
     let uuid_ipc = uuid.clone();
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    match try_ipc(ctx, move |c| {
         c.delete_track(&uuid_ipc)?;
         c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
-    });
+    })
+    .await?
+    {
+        IpcAttempt::Ok(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "modified_uuid": uuid,
+                "net": net_name, "layer": layer, "width": width,
+                "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+                "source": "ipc"
+            })))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("modify_trace", &msg)),
+        IpcAttempt::Unavailable(_) => {}
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let net_id = match require_file_net_id(&content, &net_name) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+    let (s, _) = match pf::find_block_by_uuid(&content, &["segment", "via", "arc"], &uuid) {
+        Some(span) => span,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "No track segment, via, or arc with uuid '{}' found",
+                uuid
+            )))
+        }
+    };
+    let (ws, we) = konnect_sexp::writer::find_block_with_leading_whitespace(&content, s)
+        .ok_or_else(|| anyhow::anyhow!("Unbalanced track block"))?;
+    let segment = pf::format_segment(x1, y1, x2, y2, width, &layer, net_id);
+    let close = content.rfind(')').unwrap_or(content.len());
+    let new_content = apply_edits(
+        content,
+        vec![SexpEdit::delete(ws, we), SexpEdit::insert(close, segment)],
+    );
+    write_atomic(&board_path, &new_content)?;
+
     Ok(CallToolResult::json(&json!({
         "modified_uuid": uuid,
         "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 },
+        "source": "file"
     })))
 }
 
@@ -658,7 +888,8 @@ async fn handle_create_netclass(
     Ok(CallToolResult::json(&json!({
         "created_netclass": name,
         "clearance": clearance, "trace_width": trace_width,
-        "via_drill": via_drill, "via_diameter": via_dia
+        "via_drill": via_drill, "via_diameter": via_dia,
+        "source": "file"
     })))
 }
 
@@ -714,7 +945,8 @@ async fn handle_assign_net_to_class(
         return Ok(CallToolResult::json(&json!({
             "already_assigned": true,
             "net_name": net_name,
-            "netclass": netclass
+            "netclass": netclass,
+            "source": "file"
         })));
     }
 
@@ -726,7 +958,8 @@ async fn handle_assign_net_to_class(
     Ok(CallToolResult::json(&json!({
         "assigned": true,
         "net_name": net_name,
-        "netclass": netclass
+        "netclass": netclass,
+        "source": "file"
     })))
 }
 
@@ -734,6 +967,7 @@ async fn handle_route_diff_pair(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let net_pos = match require_str(args, "net_pos") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -773,7 +1007,7 @@ async fn handle_route_diff_pair(
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    match try_ipc(ctx, move |c| {
         c.add_track(
             &np_ipc,
             &layer_ipc,
@@ -792,10 +1026,54 @@ async fn handle_route_diff_pair(
             x2 - perp_x,
             y2 - perp_y,
         )
-    });
+    })
+    .await?
+    {
+        IpcAttempt::Ok(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "net_pos": net_pos, "net_neg": net_neg,
+                "layer": layer, "width": width, "gap": gap,
+                "source": "ipc"
+            })))
+        }
+        IpcAttempt::Failed(msg) => return Ok(ipc_write_refused("route_differential_pair", &msg)),
+        IpcAttempt::Unavailable(_) => {}
+    }
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let pos_id = match require_file_net_id(&content, &net_pos) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+    let neg_id = match require_file_net_id(&content, &net_neg) {
+        Ok(id) => id,
+        Err(e) => return Ok(e),
+    };
+    let mut segments = String::new();
+    segments.push_str(&pf::format_segment(
+        x1 + perp_x,
+        y1 + perp_y,
+        x2 + perp_x,
+        y2 + perp_y,
+        width,
+        &layer,
+        pos_id,
+    ));
+    segments.push_str(&pf::format_segment(
+        x1 - perp_x,
+        y1 - perp_y,
+        x2 - perp_x,
+        y2 - perp_y,
+        width,
+        &layer,
+        neg_id,
+    ));
+    let new_content = pf::append_to_board(content, segments);
+    write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "net_pos": net_pos, "net_neg": net_neg,
-        "layer": layer, "width": width, "gap": gap
+        "layer": layer, "width": width, "gap": gap,
+        "source": "file"
     })))
 }
