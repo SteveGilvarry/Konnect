@@ -19,6 +19,7 @@ pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;
 pub mod schematic_builder;
+pub mod svg_import;
 pub mod templates;
 pub mod verification;
 

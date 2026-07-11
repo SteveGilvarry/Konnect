@@ -111,6 +111,21 @@ fn format_zone_polygon(
     )
 }
 
+/// A standalone filled polygon graphic (`gr_poly`), not tied to a net or zone
+/// fill — used for imported artwork rather than copper pours.
+fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
+    let uuid = new_uuid();
+    let pts: String = points
+        .iter()
+        .map(|(x, y)| format!("\n      (xy {x} {y})"))
+        .collect();
+    format!(
+        "\n  (gr_poly\n    (pts{pts}\n    )\n    \
+         (stroke (width 0) (type solid))\n    (fill solid)\n    \
+         (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
+    )
+}
+
 /// Find the net ID for a given net name in the .kicad_pcb content.
 fn find_net_id(content: &str, net_name: &str) -> Option<i32> {
     // Entries look like: (net 1 "GND")
@@ -278,6 +293,26 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "layer", "points"]
             }),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
+        ),
+        tool!(
+            "import_svg_logo",
+            "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
+             graphic). Curved paths are flattened into polygon outlines since KiCAD's board \
+             format doesn't support Bezier curves in filled shapes. Tries KiCAD IPC first, \
+             falls back to a direct file edit if KiCAD isn't running.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "svg":       { "type": "string", "description": "Path to the .svg file to import" },
+                    "width_mm":  { "type": "number", "description": "Target width in mm (aspect ratio preserved)" },
+                    "x":         { "type": "number", "description": "X position of the artwork's top-left corner in mm", "default": 0 },
+                    "y":         { "type": "number", "description": "Y position of the artwork's top-left corner in mm", "default": 0 },
+                    "layer":     { "type": "string", "description": "Target layer", "default": "F.SilkS" }
+                },
+                "required": ["board", "svg", "width_mm"]
+            }),
+            |args, ctx| async move { handle_import_svg_logo(args, ctx).await }
         ),
     ]
 }
@@ -763,4 +798,181 @@ async fn handle_add_zone(
         "point_count": points.len(),
         "net_id": net_id
     })))
+}
+
+async fn handle_import_svg_logo(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let svg_path = get_path(args, "svg")?;
+    let width_mm = match require_f64(args, "width_mm") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let x = args["x"].as_f64().unwrap_or(0.0);
+    let y = args["y"].as_f64().unwrap_or(0.0);
+    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+
+    let svg_content = std::fs::read_to_string(&svg_path)?;
+    let logo = crate::tools::svg_import::extract_polygons(&svg_content)?;
+    if logo.polygons.is_empty() {
+        return Ok(CallToolResult::error(
+            "No fillable paths found in the SVG (only <path> elements are supported).",
+        ));
+    }
+
+    let placed =
+        crate::tools::svg_import::scale_and_place(&logo.polygons, logo.width, width_mm, x, y);
+
+    // Try IPC first; fall through to a direct file edit if KiCAD isn't reachable.
+    let layer_ipc = layer.clone();
+    let placed_ipc = placed.clone();
+    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        let shape = builders::board_polygon(&layer_ipc, true, &placed_ipc);
+        let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+        c.create_items(vec![any])
+    })
+    .await?
+    .is_ok()
+    {
+        return Ok(CallToolResult::json(&json!({
+            "polygon_count": placed.len(),
+            "layer": layer,
+            "width_mm": width_mm,
+            "source": "ipc"
+        })));
+    }
+
+    let mut sexp = String::new();
+    for polygon in &placed {
+        sexp.push_str(&format_gr_poly(polygon, &layer));
+    }
+    let content = std::fs::read_to_string(&board_path)?;
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, sexp)]);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "polygon_count": placed.len(),
+        "layer": layer,
+        "width_mm": width_mm,
+        "source": "file"
+    })))
+}
+
+#[cfg(test)]
+mod svg_logo_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            // Deliberately empty ipc_address: with_ipc fails fast against it,
+            // exercising the file-fallback path without needing live KiCAD.
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn blank_board() -> &'static str {
+        "(kicad_pcb\n  (version 20250610)\n  (generator \"konnect\")\n  (paper \"A4\")\n  (net 0 \"\")\n)\n"
+    }
+
+    fn rect_svg() -> &'static str {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <path d="M0 0 L100 0 L100 100 L0 100 Z" fill="black"/>
+        </svg>"##
+    }
+
+    #[test]
+    fn format_gr_poly_contains_layer_fill_and_points() {
+        let sexp = format_gr_poly(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], "F.SilkS");
+        assert!(sexp.contains("(gr_poly"));
+        assert!(sexp.contains("(fill solid)"));
+        assert!(sexp.contains("(layer \"F.SilkS\")"));
+        assert!(sexp.contains("(xy 1 0)") || sexp.contains("(xy 1.0 0)"));
+    }
+
+    #[tokio::test]
+    async fn import_svg_logo_file_fallback_places_polygon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board_path = dir.path().join("board.kicad_pcb");
+        let svg_path = dir.path().join("logo.svg");
+        std::fs::write(&board_path, blank_board()).unwrap();
+        std::fs::write(&svg_path, rect_svg()).unwrap();
+
+        let ctx = test_ctx();
+        let args = json!({
+            "board": board_path.to_str().unwrap(),
+            "svg": svg_path.to_str().unwrap(),
+            "width_mm": 10.0
+        });
+
+        let result = handle_import_svg_logo(&args, &ctx)
+            .await
+            .expect("handler should succeed");
+        assert!(!result.is_error);
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["polygon_count"], json!(1));
+        assert_eq!(parsed["source"], json!("file"));
+        assert_eq!(parsed["layer"], json!("F.SilkS"));
+
+        let updated = std::fs::read_to_string(&board_path).unwrap();
+        assert!(updated.contains("(gr_poly"));
+    }
+
+    #[tokio::test]
+    async fn import_svg_logo_rejects_svg_with_no_fillable_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board_path = dir.path().join("board.kicad_pcb");
+        let svg_path = dir.path().join("empty.svg");
+        std::fs::write(&board_path, blank_board()).unwrap();
+        std::fs::write(
+            &svg_path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"##,
+        )
+        .unwrap();
+
+        let ctx = test_ctx();
+        let args = json!({
+            "board": board_path.to_str().unwrap(),
+            "svg": svg_path.to_str().unwrap(),
+            "width_mm": 10.0
+        });
+
+        let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn import_svg_logo_missing_width_mm_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board_path = dir.path().join("board.kicad_pcb");
+        let svg_path = dir.path().join("logo.svg");
+        std::fs::write(&board_path, blank_board()).unwrap();
+        std::fs::write(&svg_path, rect_svg()).unwrap();
+
+        let ctx = test_ctx();
+        let args = json!({
+            "board": board_path.to_str().unwrap(),
+            "svg": svg_path.to_str().unwrap()
+        });
+
+        let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
+        assert!(result.is_error);
+    }
 }

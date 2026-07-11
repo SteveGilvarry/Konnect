@@ -1,4 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // nng-sys's Windows IPC listener references IsValidSecurityDescriptor
+    // (advapi32) but doesn't always emit the link directive itself — without
+    // this, test executables that pull in the listener object can fail with
+    // LNK2019 unresolved externals.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=advapi32");
+    }
+
     let protos = &[
         "proto/common/envelope.proto",
         "proto/common/types/base_types.proto",

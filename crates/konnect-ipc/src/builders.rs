@@ -249,6 +249,41 @@ pub fn board_arc(
     )
 }
 
+/// Build a BoardGraphicShape polygon (or set of polygons) from closed point
+/// loops in mm — one `PolygonWithHoles` per outline, no holes. Used by
+/// `import_svg_logo` to place flattened SVG artwork as filled board graphics.
+pub fn board_polygon(
+    layer: &str,
+    filled: bool,
+    outlines: &[Vec<(f64, f64)>],
+) -> kiapi::board::types::BoardGraphicShape {
+    let polygons = outlines
+        .iter()
+        .map(|pts| kiapi::common::types::PolygonWithHoles {
+            outline: Some(kiapi::common::types::PolyLine {
+                nodes: pts
+                    .iter()
+                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
+                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                            vec2(x, y),
+                        )),
+                    })
+                    .collect(),
+                closed: true,
+            }),
+            holes: vec![],
+        })
+        .collect();
+
+    board_shape(
+        layer,
+        attrs(0.0, filled),
+        kiapi::common::types::graphic_shape::Geometry::Polygon(kiapi::common::types::PolySet {
+            polygons,
+        }),
+    )
+}
+
 /// Build a BoardText. `size_mm` sets both width and height of the glyphs.
 #[allow(clippy::too_many_arguments)]
 pub fn board_text(
@@ -369,5 +404,59 @@ mod tests {
         assert_eq!(attrs.size.unwrap().x_nm, 1_500_000);
         assert_eq!(attrs.angle.unwrap().value_degrees, 90.0);
         assert!(!attrs.mirrored);
+    }
+
+    #[test]
+    fn polygon_builds_one_polygon_with_holes_per_outline() {
+        let outlines = vec![
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
+        ];
+        let s = board_polygon("F.SilkS", true, &outlines);
+        assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
+        let shape = s.shape.expect("shape");
+        assert_eq!(
+            shape.attributes.unwrap().fill.unwrap().fill_type,
+            kiapi::common::types::GraphicFillType::GftFilled as i32
+        );
+        match shape.geometry.expect("geometry") {
+            Geometry::Polygon(poly_set) => {
+                assert_eq!(poly_set.polygons.len(), 2);
+                let first = &poly_set.polygons[0];
+                assert!(first.holes.is_empty());
+                let outline = first.outline.as_ref().expect("outline");
+                assert!(outline.closed);
+                assert_eq!(outline.nodes.len(), 3);
+            }
+            _ => panic!("expected Polygon geometry"),
+        }
+    }
+
+    #[test]
+    fn polygon_nodes_carry_point_coordinates_in_nanometers() {
+        let outlines = vec![vec![(1.0, 2.0)]];
+        let s = board_polygon("F.Cu", false, &outlines);
+        match s.shape.unwrap().geometry.unwrap() {
+            Geometry::Polygon(poly_set) => {
+                let node = &poly_set.polygons[0].outline.as_ref().unwrap().nodes[0];
+                match node.geometry.as_ref().expect("node geometry") {
+                    kiapi::common::types::poly_line_node::Geometry::Point(p) => {
+                        assert_eq!(p.x_nm, 1_000_000);
+                        assert_eq!(p.y_nm, 2_000_000);
+                    }
+                    _ => panic!("expected Point node"),
+                }
+            }
+            _ => panic!("expected Polygon geometry"),
+        }
+    }
+
+    #[test]
+    fn polygon_empty_outlines_produces_empty_polyset() {
+        let s = board_polygon("F.SilkS", true, &[]);
+        match s.shape.unwrap().geometry.unwrap() {
+            Geometry::Polygon(poly_set) => assert!(poly_set.polygons.is_empty()),
+            _ => panic!("expected Polygon geometry"),
+        }
     }
 }

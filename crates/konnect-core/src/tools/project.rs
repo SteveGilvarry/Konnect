@@ -113,13 +113,15 @@ pub fn tools() -> Vec<ToolDef> {
             "open_schematic_viewer",
             "Launch the live schematic viewer. The viewer shows the schematic as SVG and \
              auto-refreshes when the file changes. Use this after placing components so the \
-             user can see the schematic in real-time as you edit it.",
+             user can see the schematic in real-time as you edit it. For hierarchical designs, \
+             pass the root schematic — the viewer discovers every sheet reachable from it and \
+             shows a sheet selector.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": {
                         "type": "string",
-                        "description": "Path to .kicad_sch file to view"
+                        "description": "Path to the root .kicad_sch file to view"
                     }
                 },
                 "required": ["schematic"]

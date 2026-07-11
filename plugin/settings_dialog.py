@@ -128,7 +128,14 @@ class KonnectSettingsDialog(wx.Dialog):
     """Settings dialog for the Konnect plugin."""
 
     def __init__(self, parent, plugin_dir, binary_path, server_running=False):
-        super().__init__(parent, title="Konnect Settings", size=(520, 480))
+        # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
+        # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
+        # The dialog is sized to fit its content after _build_ui instead.
+        super().__init__(
+            parent,
+            title="Konnect Settings",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
         self.plugin_dir = plugin_dir
         self.binary_path = binary_path
         self.settings_path = os.path.join(plugin_dir, "settings.json")
@@ -137,6 +144,11 @@ class KonnectSettingsDialog(wx.Dialog):
 
         self._build_ui()
         self._populate_fields()
+
+        # Size to content (DPI-aware), with a sensible minimum width so the
+        # path fields aren't cramped. FromDIP scales with the display.
+        self.SetMinClientSize(self.FromDIP(wx.Size(520, 0)))
+        self.Fit()
         self.CenterOnParent()
 
     def _build_ui(self):
@@ -208,6 +220,12 @@ class KonnectSettingsDialog(wx.Dialog):
         main_sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 8)
 
         panel.SetSizer(main_sizer)
+
+        # Dialog-level sizer so Fit() sizes the dialog to the panel's content.
+        dlg_sizer = wx.BoxSizer(wx.VERTICAL)
+        dlg_sizer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(dlg_sizer)
+
         self._update_server_status()
 
     def _populate_fields(self):

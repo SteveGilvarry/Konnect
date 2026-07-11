@@ -11,7 +11,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**171 tools across 17 on-demand toolsets.** Schematic capture, PCB layout and
+**185 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -143,12 +143,20 @@ snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
 A standalone viewer that auto-refreshes as the schematic file changes:
 
 ```bash
-schematic-viewer.exe path\to\your\schematic.kicad_sch
+schematic-viewer.exe path\to\your\root_schematic.kicad_sch
 ```
 
-Pan with click-drag, zoom with the wheel, `0` to fit, `R` to refresh, drag-and-drop
-to open a different file. Also launchable by the AI via the `open_schematic_viewer`
-tool.
+Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
+too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCAD (or
+made by the AI through the schematic tools) re-render only the sheets that changed
+and refresh the view live — rendering runs against temp-folder snapshots, so the
+viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
+`0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
+by the AI via the `open_schematic_viewer` tool.
+
+Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
+`kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
+the main workspace — see [DEV.md](DEV.md) for build steps.
 
 ## Requirements
 

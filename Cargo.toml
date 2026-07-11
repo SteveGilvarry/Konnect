@@ -12,7 +12,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -63,6 +63,9 @@ base64 = "0.22"
 
 # Platform directories (home dir, config dir)
 dirs = "5"
+
+# SVG parsing (import_svg_logo)
+usvg = "0.44"
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }

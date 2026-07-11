@@ -114,11 +114,15 @@ impl KiCadIpcClient {
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
             anyhow::bail!(
-                "KiCAD IPC socket path not configured and no live socket found at \
-                 the default location. Start KiCAD with the IPC API enabled \
-                 (Preferences > Plugins > Enable IPC API), or set `ipc_address` in \
-                 Konnect's config (the ipc:// address shown in that preferences \
-                 page), or launch this plugin from KiCAD (sets KICAD_API_SOCKET)."
+                "KiCAD IPC socket path not configured. To fix: \
+                 (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
+                 and copy the listed ipc:// address; \
+                 (2) paste it into the 'IPC Socket' field of the Konnect settings dialog \
+                 (Tools > External Plugins > Konnect) and save; \
+                 (3) restart the AI client so the server rereads settings. \
+                 Alternatively set ipc_socket_path in konnect-settings.json or launch \
+                 via KiCAD (which sets KICAD_API_SOCKET). \
+                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
             );
         }
 
@@ -141,6 +145,18 @@ impl KiCadIpcClient {
         // Connect via NNG req0 socket
         let socket =
             nng::Socket::new(nng::Protocol::Req0).context("Failed to create NNG socket")?;
+
+        // Bound every step: a busy or wedged KiCAD must produce an error the
+        // tools can surface, never an indefinite hang (the predecessor
+        // project's sync/autoroute hangs blocked for >600 s on exactly this).
+        // 30 s receive allows slow board operations like zone refills.
+        use nng::options::Options;
+        socket
+            .set_opt::<nng::options::SendTimeout>(Some(std::time::Duration::from_secs(5)))
+            .context("Failed to set NNG send timeout")?;
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(30)))
+            .context("Failed to set NNG receive timeout")?;
 
         // Build the dial URL
         let dial_url =

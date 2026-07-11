@@ -389,18 +389,22 @@ pub fn pin_body_vector(pin: &LibPin, t: PinTransform) -> (f64, f64) {
     use std::f64::consts::PI;
     let a = pin.rotation * PI / 180.0;
     // Local Y-up direction toward the body, converted to schematic Y-down.
-    let mut dx = a.cos();
-    let mut dy = -a.sin();
-    if t.mirror_x {
-        dx = -dx;
-    }
-    if t.mirror_y {
-        dy = -dy;
-    }
-    // Same rotation convention as transform_pin (Y-down space).
+    let dx0 = a.cos();
+    let dy0 = -a.sin();
+    // Same convention as transform_pin: rotate screen-CCW in Y-down space,
+    // then mirror AFTER rotation ((mirror x) negates screen-Y, (mirror y)
+    // negates screen-X).
     let th = t.rotation_deg * PI / 180.0;
     let (c, s) = (th.cos(), th.sin());
-    (dx * c - dy * s, -dx * s + dy * c)
+    let mut dx = dx0 * c + dy0 * s;
+    let mut dy = -dx0 * s + dy0 * c;
+    if t.mirror_x {
+        dy = -dy;
+    }
+    if t.mirror_y {
+        dx = -dx;
+    }
+    (dx, dy)
 }
 
 // ─── T-Junction detection ─────────────────────────────────────────────────────

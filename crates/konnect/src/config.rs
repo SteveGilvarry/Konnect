@@ -154,3 +154,109 @@ fn dirs_config_path() -> PathBuf {
             .join("config.toml")
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp(ext: &str, content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(&format!(".{ext}"))
+            .tempfile()
+            .unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    // Malformed input must produce Err, never a panic (the class of bug
+    // PR #9 found in the config *tools*; this pins the server config too).
+
+    #[test]
+    fn json_non_object_root_is_err_not_panic() {
+        for bad in ["[1, 2, 3]", "42", "\"just a string\"", "null", "true"] {
+            let f = write_temp("json", bad);
+            assert!(Config::load_from(f.path()).is_err(), "input: {bad}");
+        }
+    }
+
+    #[test]
+    fn json_wrong_field_types_are_err() {
+        for bad in [
+            r#"{"transport": 42}"#,
+            r#"{"transport": "carrier-pigeon"}"#,
+            r#"{"kicad_cli": ["a", "b"]}"#,
+            r#"{"log_level": {"nested": true}}"#,
+        ] {
+            let f = write_temp("json", bad);
+            assert!(Config::load_from(f.path()).is_err(), "input: {bad}");
+        }
+    }
+
+    #[test]
+    fn toml_garbage_is_err_not_panic() {
+        for bad in ["= = =", "[unclosed", "transport = ", "\u{0000}\u{FFFF}"] {
+            let f = write_temp("toml", bad);
+            assert!(Config::load_from(f.path()).is_err(), "input: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn missing_file_is_err() {
+        assert!(Config::load_from(std::path::Path::new("does/not/exist.toml")).is_err());
+    }
+
+    // Partial configs fill in defaults for everything omitted.
+
+    #[test]
+    fn empty_json_object_yields_defaults() {
+        let f = write_temp("json", "{}");
+        let c = Config::load_from(f.path()).unwrap();
+        let d = Config::default();
+        assert_eq!(c.kicad_cli, d.kicad_cli);
+        assert_eq!(c.http_address, d.http_address);
+        assert_eq!(c.log_level, d.log_level);
+        assert!(matches!(c.transport, TransportMode::Stdio));
+    }
+
+    #[test]
+    fn empty_toml_yields_defaults() {
+        let f = write_temp("toml", "");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.log_level, "info");
+    }
+
+    #[test]
+    fn partial_toml_overrides_only_named_fields() {
+        let f = write_temp(
+            "toml",
+            "transport = \"http\"\nhttp_address = \"127.0.0.1:9999\"\n",
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(matches!(
+            c.transport,
+            TransportMode::Both | TransportMode::Http
+        ));
+        assert!(matches!(c.transport, TransportMode::Http));
+        assert_eq!(c.http_address, "127.0.0.1:9999");
+        assert_eq!(c.log_level, "info"); // untouched default
+    }
+
+    #[test]
+    fn legacy_ipc_socket_path_alias_still_works() {
+        // settings.json written by the KiCAD plugin dialog uses the alias.
+        let f = write_temp("json", r#"{"ipc_socket_path": "ipc://test.sock"}"#);
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.ipc_address, "ipc://test.sock");
+    }
+
+    #[test]
+    fn unknown_extension_parses_as_toml() {
+        let f = write_temp("conf", "log_level = \"debug\"\n");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.log_level, "debug");
+    }
+}

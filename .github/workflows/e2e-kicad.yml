@@ -1,0 +1,86 @@
+name: E2E (real KiCAD)
+
+# Full-stack verification against a real KiCAD installation:
+#   - the e2e test drives the shipped binary over stdio through
+#     create → place → wire → ERC → Gerber export → DRC using real kicad-cli
+#   - the conformance suite round-trips every schematic in KiCAD's demo corpus
+#   - the PCM package is assembled and schema-validated
+#
+# Runs weekly, on release tags, and on demand. Not per-PR: installing KiCAD
+# costs several minutes and the per-PR suite already covers everything that
+# doesn't need a real KiCAD.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: Full design loop on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-kicad
+
+      - name: Install KiCAD
+        run: choco install kicad --no-progress --yes
+
+      - name: Locate kicad-cli and demos
+        id: kicad
+        shell: pwsh
+        run: |
+          $cli = Get-ChildItem "C:\Program Files\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cli) { $cli = Get-ChildItem "C:\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName }
+          if (-not $cli) { throw "kicad-cli.exe not found after install" }
+          "KICAD_CLI=$cli" | Out-File $env:GITHUB_ENV -Append
+          $demos = Join-Path (Split-Path (Split-Path $cli)) "share\kicad\demos"
+          if (Test-Path $demos) { "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append }
+          & $cli --version
+
+      - name: E2E design loop (create → wire → ERC → Gerber → DRC)
+        env:
+          KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
+        run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
+
+      - name: Demo-corpus conformance (115+ eeschema-authored schematics)
+        run: cargo test -p konnect-core --test conformance_test -- --nocapture
+
+      - name: IPC wedge timeout regression
+        run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
+
+      - name: Assemble + schema-validate PCM package
+        shell: pwsh
+        run: |
+          pip install jsonschema
+          cargo build --release -p konnect
+          ./packaging/build-pcm.ps1 -Version 0.0.0 -BinaryPath target/release/konnect.exe -OutDir dist
+          python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0.zip
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-artifacts
+          path: |
+            dist/
+            e2e-artifacts/
+          if-no-files-found: ignore

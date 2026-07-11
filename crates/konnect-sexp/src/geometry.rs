@@ -1,23 +1,29 @@
 //! Canonical KiCAD pin coordinate transforms.
 //!
-//! This is THE single authoritative implementation replacing 10 duplicated sites
-//! in the Python codebase. All toolset code must call these functions.
+//! This is THE single authoritative implementation. All toolset code must
+//! call these functions.
 //!
-//! # KiCAD Coordinate System Rules
+//! # KiCAD Coordinate System Rules (verified against eeschema via
+//! `kicad-cli sch export netlist` — see the ground-truth tests below)
 //!
-//! 1. Symbol pin coordinates are in **Y-up** local space.
-//! 2. Schematic placement uses **Y-down** global space.
+//! 1. Symbol pin coordinates are in **Y-up** library space.
+//! 2. Schematic placement uses **Y-down** screen space.
 //!    → Negate pin_y before any transform.
 //!
-//! 3. Mirror transforms are applied **BEFORE** rotation.
-//!    → mirror_x flips the X axis: pin_x = -pin_x
-//!    → mirror_y flips the Y axis: pin_y = -pin_y  (already negated from step 1)
-//!
-//! 4. KiCAD rotation formula (NOT standard counter-clockwise):
+//! 3. Rotation is **screen-CCW** in Y-down space — eeschema's TRANSFORM
+//!    matrix for rotation 90° is (0, 1, -1, 0), i.e. (x, y) → (y, -x):
 //!    rot_x =  x * cos(θ) + y * sin(θ)
 //!    rot_y = -x * sin(θ) + y * cos(θ)
 //!
-//! 5. Final position = component origin + rotated offset.
+//! 4. Mirror is applied **AFTER** rotation (it reflects the already-placed
+//!    symbol). Axis semantics match eeschema's `symbol.h`:
+//!    → `(mirror x)` = SYM_MIRROR_X = TRANSFORM(1, 0, 0, -1) → negates screen-Y
+//!    → `(mirror y)` = SYM_MIRROR_Y = TRANSFORM(-1, 0, 0, 1) → negates screen-X
+//!    Applying mirror before rotation only agrees at 0°/180°; at 90°/270° it
+//!    swaps the pins (the predecessor project shipped that bug — see
+//!    KiCAD-MCP-Server test_pin_world_xy_eeschema_truth.py).
+//!
+//! 5. Final position = component origin + transformed offset.
 
 use std::f64::consts::PI;
 
@@ -54,27 +60,26 @@ pub struct PinTransform {
 /// assert!((y - 5.0).abs() < 1e-9);
 /// ```
 pub fn transform_pin(pin_x: f64, pin_y: f64, t: PinTransform) -> (f64, f64) {
-    // Step 1: Convert from Y-up (symbol local) to Y-down (schematic).
-    let mut lx = pin_x;
-    let mut ly = -pin_y; // negate Y
+    // Step 1: Convert from Y-up (library) to Y-down (screen).
+    let lx = pin_x;
+    let ly = -pin_y;
 
-    // Step 2: Apply mirror transforms (before rotation).
-    if t.mirror_x {
-        lx = -lx;
-    }
-    if t.mirror_y {
-        ly = -ly;
-    }
-
-    // Step 3: Apply KiCAD rotation (Y-down space).
-    // Formula from pin_locator.py:
-    //   rotated_x = x * cos(θ) - y * sin(θ)  (standard X)
-    //   rotated_y = -x * sin(θ) + y * cos(θ)  (Y-down convention)
+    // Step 2: Rotate, screen-CCW in Y-down space. eeschema's TRANSFORM for
+    // 90° is (0, 1, -1, 0): (x, y) → (y, -x).
     let theta = t.rotation_deg * PI / 180.0;
     let cos_t = theta.cos();
     let sin_t = theta.sin();
-    let rx = lx * cos_t - ly * sin_t;
-    let ry = -lx * sin_t + ly * cos_t;
+    let mut rx = lx * cos_t + ly * sin_t;
+    let mut ry = -lx * sin_t + ly * cos_t;
+
+    // Step 3: Mirror AFTER rotation — reflects the placed symbol.
+    // `(mirror x)` negates screen-Y; `(mirror y)` negates screen-X.
+    if t.mirror_x {
+        ry = -ry;
+    }
+    if t.mirror_y {
+        rx = -rx;
+    }
 
     // Step 4: Translate to component origin.
     (t.comp_x + rx, t.comp_y + ry)
@@ -126,6 +131,96 @@ mod tests {
         }
     }
 
+    fn assert_pin(pin: (f64, f64), tr: PinTransform, expected: (f64, f64), label: &str) {
+        let (x, y) = transform_pin(pin.0, pin.1, tr);
+        assert!(
+            (x - expected.0).abs() < 1e-6 && (y - expected.1).abs() < 1e-6,
+            "{}: got ({}, {}), eeschema ground truth ({}, {})",
+            label,
+            x,
+            y,
+            expected.0,
+            expected.1
+        );
+    }
+
+    /// Ground truth: Device:R pin 1 sits at library (0, +3.81), symbol placed
+    /// at (100, 100). Expected world positions verified against eeschema via
+    /// `kicad-cli sch export netlist` in the predecessor project's
+    /// test_pin_world_xy_eeschema_truth.py (label-to-pin netlist binding).
+    #[test]
+    fn eeschema_ground_truth_rotations() {
+        let pin = (0.0, 3.81);
+        // rot 0: internal (0, -3.81) → world (100, 96.19)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 0.0, false, false),
+            (100.0, 96.19),
+            "rot0",
+        );
+        // rot 90: TRANSFORM(0,1,-1,0): (x,y)→(y,-x): (0,-3.81)→(-3.81, 0)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 90.0, false, false),
+            (96.19, 100.0),
+            "rot90",
+        );
+        // rot 180: (x,y)→(-x,-y): (0,-3.81)→(0, 3.81)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 180.0, false, false),
+            (100.0, 103.81),
+            "rot180",
+        );
+        // rot 270: (x,y)→(-y,x): (0,-3.81)→(3.81, 0)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 270.0, false, false),
+            (103.81, 100.0),
+            "rot270",
+        );
+    }
+
+    #[test]
+    fn eeschema_ground_truth_mirrors() {
+        let pin = (0.0, 3.81);
+        // (mirror x) = SYM_MIRROR_X = TRANSFORM(1,0,0,-1) → negates screen-Y:
+        // internal (0,-3.81) → (0, 3.81) → world (100, 103.81)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 0.0, true, false),
+            (100.0, 103.81),
+            "mirror_x",
+        );
+        // (mirror y) = SYM_MIRROR_Y = TRANSFORM(-1,0,0,1) → negates screen-X:
+        // internal (0,-3.81) unchanged in X → world (100, 96.19)
+        assert_pin(
+            pin,
+            t(100.0, 100.0, 0.0, false, true),
+            (100.0, 96.19),
+            "mirror_y",
+        );
+    }
+
+    /// The order bug the predecessor shipped: mirror-before-rotation agrees
+    /// with eeschema at 0°/180° but swaps pins at 90°/270°. This case has
+    /// nonzero X and Y so the wrong order produces a different answer.
+    #[test]
+    fn mirror_applies_after_rotation() {
+        // lib (2.54, 1.27) → internal (2.54, -1.27)
+        // rot 90 → (y, -x) = (-1.27, -2.54)
+        // mirror x (negate screen-Y) → (-1.27, 2.54)
+        assert_pin(
+            (2.54, 1.27),
+            t(0.0, 0.0, 90.0, true, false),
+            (-1.27, 2.54),
+            "rot90+mirror_x",
+        );
+        // Buggy order (mirror first) would give: mirror_x on internal
+        // (2.54, -1.27) → wrong axis semantics aside, rotating a pre-mirrored
+        // point yields ((-1.27, -2.54) negated in the wrong slot) ≠ above.
+    }
+
     #[test]
     fn no_transform() {
         let (x, y) = transform_pin(2.54, 0.0, t(10.0, 5.0, 0.0, false, false));
@@ -142,10 +237,8 @@ mod tests {
     }
 
     #[test]
-    fn rotation_90() {
-        // pin at (1, 0) local Y-up → after Y negation: (1, 0) in Y-down
-        // rotated 90°: rx = 1*cos90 - 0*sin90 = 0
-        //              ry = -1*sin90 + 0*cos90 = -1
+    fn rotation_90_pin_on_x_axis() {
+        // pin at (1, 0) lib → internal (1, 0) → rot90 (y,-x) → (0, -1)
         let (x, y) = transform_pin(1.0, 0.0, t(0.0, 0.0, 90.0, false, false));
         assert!((x).abs() < 1e-6, "x={}", x);
         assert!((y - -1.0).abs() < 1e-6, "y={}", y);
@@ -156,13 +249,6 @@ mod tests {
         let (x, y) = transform_pin(1.0, 0.0, t(0.0, 0.0, 180.0, false, false));
         assert!((x - -1.0).abs() < 1e-6, "x={}", x);
         assert!((y).abs() < 1e-6, "y={}", y);
-    }
-
-    #[test]
-    fn mirror_x() {
-        let (x, y) = transform_pin(1.0, 0.0, t(0.0, 0.0, 0.0, true, false));
-        assert!((x - -1.0).abs() < 1e-9, "x={}", x);
-        assert!((y).abs() < 1e-9, "y={}", y);
     }
 
     #[test]

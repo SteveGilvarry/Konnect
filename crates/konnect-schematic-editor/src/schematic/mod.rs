@@ -440,11 +440,15 @@ impl Schematic {
         if let Some(v) = self.version {
             c.push(tagged("version", vec![atom(v.to_string())]));
         }
+        // generator / generator_version are STRING fields — eeschema writes
+        // them quoted and KiCAD 10 refuses to load the file when they are
+        // bare atoms (found by the real-KiCAD e2e test: "Failed to load
+        // schematic" after any tool that re-serialized through this model).
         if let Some(g) = &self.generator {
-            c.push(tagged("generator", vec![atom(g.clone())]));
+            c.push(tagged("generator", vec![qstr(g.clone())]));
         }
         if let Some(gv) = &self.generator_version {
-            c.push(tagged("generator_version", vec![atom(gv.clone())]));
+            c.push(tagged("generator_version", vec![qstr(gv.clone())]));
         }
         if let Some(u) = &self.uuid {
             c.push(tagged("uuid", vec![qstr(u.clone())]));

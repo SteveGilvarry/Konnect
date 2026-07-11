@@ -14,16 +14,9 @@ Opening an issue is the best way to influence priority.
 
 ## Tools
 
-- **`import_svg_logo`** — import an SVG file as silkscreen / copper artwork
-  (path parsing + polygon tessellation, placed via the IPC API).
-- **Hierarchical sheets** — create and manage multi-sheet schematics
-  (hierarchical sheets, sheet pins, cross-sheet nets).
 - **Symbol & footprint creation** — author new library parts from scratch, not
   just search and place existing ones.
 - **Eagle project import** — migrate legacy Eagle designs.
-- **Multi-sheet schematic viewer** — `kicad-cli sch export svg` emits one SVG
-  per sheet; the live viewer currently shows only the root sheet. Add a sheet
-  selector for hierarchical designs.
 
 ## Infrastructure
 
@@ -45,3 +38,18 @@ Opening an issue is the best way to influence priority.
 - ~~Component search caching~~ — `search_jlcpcb_parts`, `get_jlcpcb_part`, and
   `suggest_jlcpcb_alternatives` now cache results for 5 minutes via a shared
   `QueryCache` on `ToolContext`; responses carry a `"cached"` field.
+- ~~Hierarchical sheets~~ — create and manage multi-sheet schematics via the
+  new `sch_hierarchy` toolset: sheet lifecycle (add/edit/move/delete/duplicate,
+  recursive hierarchy and page-numbering queries) plus sheet pin lifecycle
+  (import from hierarchical labels, add/edit/delete pins, pin/label sync
+  validation).
+- ~~`import_svg_logo`~~ — import an SVG file as filled silkscreen/copper
+  artwork via the new `import_svg_logo` tool in the `pcb_board` toolset.
+  Curved paths (quadratic/cubic Bezier) are flattened into polygon outlines
+  since KiCAD's board format doesn't support curves in filled shapes. Tries
+  the IPC API first, falls back to a direct file edit if KiCAD isn't running.
+- ~~Multi-sheet schematic viewer~~ — point the viewer at the root schematic of a
+  hierarchical design and it walks every reachable sheet, renders each via
+  `kicad-cli`, and offers a depth-indented sheet selector. Edits saved from KiCAD
+  re-render only the changed sheets and refresh live; rendering runs against
+  temp-folder snapshots so the viewer never blocks KiCAD from saving.

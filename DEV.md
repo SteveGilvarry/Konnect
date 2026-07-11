@@ -17,6 +17,13 @@ cd crates/schematic-viewer
 cargo build --release
 ```
 
+Schematic-viewer build notes (Windows):
+
+- If `cargo` is not recognized in a fresh shell, add it to the session PATH first:
+  `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`
+- Close any running viewer window before rebuilding — Windows locks a running
+  `.exe`, so the link step fails while the app is open.
+
 ## Architecture
 
 ```
@@ -45,17 +52,18 @@ Konnect/
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
+│   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 6 tools (incl. open_schematic_viewer)
 │   │           ├── sch_components.rs # 17 tools (component placement with lib_symbols embedding)
 │   │           ├── sch_wiring.rs     # 19 tools (incl. connect_pins, power symbol embedding)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 10 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC)
-│   │           ├── sch_hierarchy.rs  # 7 tools (typed Sheet model, add/edit/move/delete/duplicate + hierarchy/page queries)
-│   │           ├── pcb_board.rs      # 10 tools (S-expr file editing, IPC fallback)
+│   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
+│   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 13 tools (IPC real-time via NNG+protobuf)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
-│   │           ├── pcb_export.rs     # 9 tools (Gerber, PDF, 3D, DRC)
+│   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 14 tools (symbol/footprint library management)
 │   │           ├── integration.rs    # 11 tools (JLCPCB SQLite, Freerouting, datasheets)
 │   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
@@ -82,8 +90,9 @@ Konnect/
 │   │
 │   └── schematic-viewer/            # Tauri desktop app (separate from workspace)
 │       ├── tauri.conf.json
-│       ├── src/main.rs               # File watcher + kicad-cli SVG rendering + Tauri commands
-│       └── frontend/index.html       # Pan/zoom SVG viewer with auto-refresh
+│       ├── capabilities/default.json # Tauri 2 ACL grant (core:default) — without it event.listen() is silently denied
+│       ├── src/main.rs               # Multi-sheet watcher + snapshot-isolated incremental kicad-cli SVG rendering + Tauri commands, 20 unit tests
+│       └── frontend/index.html       # Pan/zoom SVG viewer, sheet selector, auto-refresh
 │
 ├── plugin/                           # Python thin launcher (runs inside KiCAD)
 │   ├── __init__.py                   # pcbnew.ActionPlugin — settings dialog (PCB Editor only)
@@ -199,7 +208,14 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
 - `protoc` binary (for protobuf code generation in konnect-ipc crate)
   - Set `PROTOC` environment variable or install on PATH
   - Download: https://github.com/protocolbuffers/protobuf/releases
-- For schematic-viewer: Tauri 2 prerequisites (WebView2 on Windows — usually pre-installed)
+- For schematic-viewer (built separately from the workspace — see Quick Start):
+  - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`
+    isn't recognized in the shell)
+  - Tauri 2 prerequisites: WebView2 runtime on Windows (usually pre-installed on Win 10/11)
+  - At runtime it discovers `kicad-cli` from the standard KiCAD install paths, then PATH;
+    override with `--kicad-cli <path>`
+  - Rebuilds fail while a viewer window is open (Windows locks the running `.exe`) — close
+    the app before `cargo build`
 
 ## Test Suite
 
@@ -212,6 +228,16 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `konnect-core` integration tests | Fixture files: parse, edit, write, observability, structured errors |
 | `konnect-schematic-editor` tests | Typed schematic model + round-tripping |
 
+`schematic-viewer` is **excluded from the workspace** (`Cargo.toml`'s `[workspace] exclude`) since
+it's a Tauri app built separately — `cargo test --workspace` never touches it, and neither does
+CI (`.github/workflows/ci.yml` runs everything with `--workspace`). Run its tests explicitly:
+`cd crates/schematic-viewer && cargo test`. Its 20 unit tests cover the pure sheet-tree-walking,
+watch-directory, render-snapshot, event-debounce, and incremental-render-selection logic
+(`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
+`files_needing_render`, `render_all`'s error handling) — the actual `kicad-cli` subprocess call
+and Tauri command/event plumbing stay thin and untested, matching this codebase's existing
+convention for other `kicad-cli`-calling code.
+
 ## Adding a New Tool
 
 1. Add the `tool!(...)` definition to the appropriate toolset's `tools()` vec
@@ -222,9 +248,9 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 
 ## Current Stats
 
-- **18 toolsets, 182 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 185 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~188 tools / ~24K tokens
+- Full-catalog `tools/list` (all loaded): ~191 tools / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

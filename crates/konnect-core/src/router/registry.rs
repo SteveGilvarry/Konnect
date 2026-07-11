@@ -28,7 +28,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_components",
         description: "Add, edit, move, rotate, and delete schematic symbols",
         category: "schematic",
-        tool_count: 17,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "sch_wiring",
@@ -46,7 +46,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_batch",
         description: "Bulk add, edit, delete, and move schematic elements in one call",
         category: "schematic",
-        tool_count: 10,
+        tool_count: 11,
     },
     ToolsetMeta {
         name: "sch_export",
@@ -56,15 +56,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy queries, page renumbering, and whole-project instance repair",
+        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation, whole-project instance repair",
         category: "schematic",
-        tool_count: 8,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text",
+        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 10,
+        tool_count: 11,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -88,7 +88,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "library",
         description: "Symbol libraries, footprint libraries, search and registration",
         category: "library",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "integration",

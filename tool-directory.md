@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **182 registered tools** + **6 always-visible meta-tools** = **188 total**
+- **185 registered tools** + **6 always-visible meta-tools** = **191 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -22,7 +22,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 17 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 18 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -157,11 +157,9 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 
-### `sch_hierarchy` · 7 tools
-**Purpose:** Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy and page-numbering queries.
+### `sch_hierarchy` · 12 tools
+**Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
-
-Sheet lifecycle only (PR-A); pin lifecycle (`import_sheet_pins`, `add_sheet_pin`, `edit_sheet_pin`, `delete_sheet_pin`) lands in a follow-up.
 
 | Tool | Description |
 |------|-------------|
@@ -172,13 +170,18 @@ Sheet lifecycle only (PR-A); pin lifecycle (`import_sheet_pins`, `add_sheet_pin`
 | `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
 | `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
 | `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
+| `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. |
+| `add_sheet_pin` | Manually add a single pin to an existing sheet block. |
+| `edit_sheet_pin` | Rename a pin, change its electrical type, or reposition it along the sheet border. |
+| `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
+| `validate_sheet_pins` | Read-only. Walk the sheet tree and report hierarchical_labels with no matching parent pin, and pins with no matching child label. |
 
 ---
 
 ## PCB
 
-### `pcb_board` · 10 tools
-**Purpose:** Board outline, layers, zones, mounting holes, board text.
+### `pcb_board` · 11 tools
+**Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -193,6 +196,7 @@ Sheet lifecycle only (PR-A); pin lifecycle (`import_sheet_pins`, `add_sheet_pin`
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
+| `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
 ### `pcb_components` · 13 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.

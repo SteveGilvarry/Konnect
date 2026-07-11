@@ -48,10 +48,12 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             );
                         }
                     }
-                    // Unit/variant sub-symbol names ("Name_0_1") must stay
-                    // UNQUALIFIED: KiCAD prefixes only the top-level name in a
-                    // schematic's lib_symbols table and rejects the whole file
-                    // if nested unit names carry a "Lib:" prefix.
+                    // Unit sub-symbols ("Name_0_1", "Name_1_1") must stay
+                    // UNPREFIXED: eeschema names only the outer symbol with
+                    // the library prefix and refuses to load a schematic
+                    // whose units carry it ("Failed to load schematic" —
+                    // verified against kicad-cli 10.0 and the KiCAD demo
+                    // corpus, which embeds units without the prefix).
                     return Some(renamed);
                 }
             }
@@ -77,7 +79,10 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             );
                         }
                     }
-                    // Unit sub-symbol names stay unqualified — see note above.
+                    // Unit sub-symbols stay UNPREFIXED here too — same rule
+                    // as the symdir branch above (eeschema refuses prefixed
+                    // unit names; hit in CI where KiCAD ships single-file
+                    // libraries and this legacy branch handles the embed).
                     return Some(renamed);
                 }
             }

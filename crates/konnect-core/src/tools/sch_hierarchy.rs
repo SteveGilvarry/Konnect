@@ -1,9 +1,7 @@
-//! `sch_hierarchy` toolset — PR-A: hierarchical sheet lifecycle.
-//!
-//! Sheet pin lifecycle (import/add/edit/delete pins) lands in a follow-up PR;
-//! this toolset covers the sheet object itself: add, edit, move, delete,
-//! duplicate, and the recursive hierarchy/page-numbering queries needed to
-//! reason about a multi-sheet design.
+//! `sch_hierarchy` toolset — sheet object lifecycle (PR-A) plus sheet pin
+//! lifecycle (PR-B): add, edit, move, delete, duplicate a sheet; recursive
+//! hierarchy/page-numbering queries; import/add/edit/delete sheet pins and a
+//! read-only pin/label sync check.
 //!
 //! Every handler here is file-editing only — KiCAD's own IPC API has no
 //! schematic-editing commands upstream (`schematic_commands.proto` is empty),
@@ -146,6 +144,90 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_renumber_sheet_pages(args, ctx).await }
         ),
         tool!(
+            "import_sheet_pins",
+            "Scan the child sheet's hierarchical_labels and auto-generate matching pins on \
+             the parent sheet block, skipping names that already have a pin. This is the \
+             primary, expected way sheet pins get created — mirrors KiCAD's own 'Import Sheet \
+             Pins' command rather than pairing every pin to a label by hand. New pins are \
+             placed along one edge of the sheet box, stacked below any existing pins.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
+                    "sheet_name": { "type": "string" },
+                    "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" },
+                    "project_name": { "type": "string", "description": "Default: ''" }
+                },
+                "required": ["schematic", "sheet_name"]
+            }),
+            |args, ctx| async move { handle_import_sheet_pins(args, ctx).await }
+        ),
+        tool!(
+            "add_sheet_pin",
+            "Manually add a single pin to an existing sheet block. Prefer import_sheet_pins \
+             for the common case; use this when a hierarchical_label hasn't been written yet \
+             or a pin needs to exist ahead of the label.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "sheet_name": { "type": "string" },
+                    "pin_name": { "type": "string" },
+                    "pin_type": { "type": "string", "enum": ["input", "output", "bidirectional", "tri_state", "passive"] },
+                    "x": { "type": "number" }, "y": { "type": "number" }
+                },
+                "required": ["schematic", "sheet_name", "pin_name", "pin_type", "x", "y"]
+            }),
+            |args, ctx| async move { handle_add_sheet_pin(args, ctx).await }
+        ),
+        tool!(
+            "edit_sheet_pin",
+            "Rename a sheet pin, change its electrical type, or reposition it along the \
+             sheet border. Provide at least one of: new_name, pin_type, or both x+y.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "sheet_name": { "type": "string" },
+                    "pin_name": { "type": "string", "description": "Current pin name to look up" },
+                    "new_name": { "type": "string" },
+                    "pin_type": { "type": "string", "enum": ["input", "output", "bidirectional", "tri_state", "passive"] },
+                    "x": { "type": "number" }, "y": { "type": "number" }
+                },
+                "required": ["schematic", "sheet_name", "pin_name"]
+            }),
+            |args, ctx| async move { handle_edit_sheet_pin(args, ctx).await }
+        ),
+        tool!(
+            "delete_sheet_pin",
+            "Remove a single pin from a sheet without touching the rest of the sheet.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "sheet_name": { "type": "string" },
+                    "pin_name": { "type": "string" }
+                },
+                "required": ["schematic", "sheet_name", "pin_name"]
+            }),
+            |args, ctx| async move { handle_delete_sheet_pin(args, ctx).await }
+        ),
+        tool!(
+            "validate_sheet_pins",
+            "Read-only. Walk the whole sheet tree from a root schematic and report \
+             hierarchical_labels with no matching parent sheet pin, and sheet pins with no \
+             matching child hierarchical_label. Does not modify anything — use as a pre-ERC \
+             sanity check or to catch drift after manual edits.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Root schematic to start from" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_validate_sheet_pins(args, ctx).await }
+        ),
+        tool!(
             "repair_hierarchy_instances",
             "Rewrite the whole project's instance data the way KiCAD itself saves it: \
              ensure the root schematic has a top-level UUID, then walk every sheet \
@@ -169,6 +251,20 @@ pub fn tools() -> Vec<ToolDef> {
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 const MAX_HIERARCHY_DEPTH: usize = 20;
+const ALLOWED_PIN_TYPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
+const SHEET_PIN_SPACING_MM: f64 = 2.54;
+
+fn validate_pin_type(pin_type: &str) -> Result<(), CallToolResult> {
+    if ALLOWED_PIN_TYPES.contains(&pin_type) {
+        Ok(())
+    } else {
+        Err(CallToolResult::error(format!(
+            "Invalid pin_type '{}' — must be one of: {}",
+            pin_type,
+            ALLOWED_PIN_TYPES.join(", ")
+        )))
+    }
+}
 
 fn parent_dir(sch_path: &Path) -> PathBuf {
     sch_path
@@ -668,6 +764,351 @@ fn renumber_walk(
 
     if changed {
         sch.overwrite()?;
+    }
+    visited.remove(&canon);
+    Ok(())
+}
+
+async fn handle_import_sheet_pins(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let sheet_name = match require_str(args, "sheet_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let side = opt_str(args, "side").unwrap_or("right").to_string();
+    if side != "right" && side != "left" {
+        return Ok(CallToolResult::error(format!(
+            "Invalid side '{}' — must be 'right' or 'left'",
+            side
+        )));
+    }
+
+    let mut parent = cse::Schematic::load(&sch_path)?;
+    let dir = parent_dir(&sch_path);
+
+    let (child_path, sheet_x, sheet_y, sheet_w, existing_pin_count) =
+        match parent.sheets.by_name(&sheet_name) {
+            Some(s) => {
+                let (x, y) = s.position();
+                (dir.join(s.file()), x, y, s.width, s.pins.len())
+            }
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "Sheet '{}' not found",
+                    sheet_name
+                )))
+            }
+        };
+
+    if !child_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Child file '{}' not found on disk — cannot read its hierarchical labels",
+            child_path.display()
+        )));
+    }
+    let child = cse::Schematic::load(&child_path)?;
+    let label_names: Vec<(String, String)> = child
+        .hierarchical_labels
+        .iter()
+        .map(|l| {
+            (
+                l.text.clone(),
+                l.shape.clone().unwrap_or_else(|| "passive".to_string()),
+            )
+        })
+        .collect();
+
+    let sheet = parent
+        .sheets
+        .by_name_mut(&sheet_name)
+        .expect("looked up above");
+
+    let edge_x = if side == "right" {
+        sheet_x + sheet_w
+    } else {
+        sheet_x
+    };
+    let rotation = if side == "right" { 0.0 } else { 180.0 };
+
+    let mut imported = Vec::new();
+    let mut skipped_existing = Vec::new();
+    let mut slot = existing_pin_count;
+    for (name, shape) in label_names {
+        if sheet.pin_by_name(&name).is_some() {
+            skipped_existing.push(name);
+            continue;
+        }
+        let pin_type = if ALLOWED_PIN_TYPES.contains(&shape.as_str()) {
+            shape
+        } else {
+            "passive".to_string()
+        };
+        slot += 1;
+        let y = sheet_y + SHEET_PIN_SPACING_MM * slot as f64;
+        let mut pin = cse::SheetPin::new(name.as_str(), pin_type.as_str(), edge_x, y);
+        pin.at.rotation = Some(rotation);
+        imported.push(pin.name.clone());
+        sheet.add_pin(pin);
+    }
+
+    if !imported.is_empty() {
+        parent.overwrite()?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "sheet": sheet_name,
+        "imported_pins": imported,
+        "skipped_existing": skipped_existing
+    })))
+}
+
+async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let sheet_name = match require_str(args, "sheet_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pin_name = match require_str(args, "pin_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pin_type = match require_str(args, "pin_type") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    if let Err(e) = validate_pin_type(&pin_type) {
+        return Ok(e);
+    }
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let sheet = match sch.sheets.by_name_mut(&sheet_name) {
+        Some(s) => s,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Sheet '{}' not found",
+                sheet_name
+            )))
+        }
+    };
+
+    if sheet.pin_by_name(&pin_name).is_some() {
+        return Ok(CallToolResult::error(format!(
+            "Sheet '{}' already has a pin named '{}'",
+            sheet_name, pin_name
+        )));
+    }
+
+    sheet.add_pin(cse::SheetPin::new(
+        pin_name.as_str(),
+        pin_type.as_str(),
+        x,
+        y,
+    ));
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "added_pin": pin_name,
+        "sheet": sheet_name,
+        "pin_type": pin_type,
+        "x": x,
+        "y": y
+    })))
+}
+
+async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let sheet_name = match require_str(args, "sheet_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pin_name = match require_str(args, "pin_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    if let Some(pt) = opt_str(args, "pin_type") {
+        if let Err(e) = validate_pin_type(pt) {
+            return Ok(e);
+        }
+    }
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let sheet = match sch.sheets.by_name_mut(&sheet_name) {
+        Some(s) => s,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Sheet '{}' not found",
+                sheet_name
+            )))
+        }
+    };
+    let pin = match sheet.pin_by_name_mut(&pin_name) {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Pin '{}' not found on sheet '{}'",
+                pin_name, sheet_name
+            )))
+        }
+    };
+
+    let mut changed = Vec::new();
+    if let Some(new_name) = opt_str(args, "new_name") {
+        pin.name = new_name.to_string();
+        changed.push("name");
+    }
+    if let Some(pt) = opt_str(args, "pin_type") {
+        pin.pin_type = pt.to_string();
+        changed.push("pin_type");
+    }
+    if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
+        pin.at.x = x;
+        pin.at.y = y;
+        changed.push("position");
+    }
+
+    if changed.is_empty() {
+        return Ok(CallToolResult::error(
+            "No fields to change — provide at least one of: new_name, pin_type, x+y",
+        ));
+    }
+
+    let summary = json!({
+        "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
+    });
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "edited_pin": pin_name,
+        "sheet": sheet_name,
+        "changed_fields": changed,
+        "pin": summary
+    })))
+}
+
+async fn handle_delete_sheet_pin(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let sheet_name = match require_str(args, "sheet_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pin_name = match require_str(args, "pin_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let sheet = match sch.sheets.by_name_mut(&sheet_name) {
+        Some(s) => s,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Sheet '{}' not found",
+                sheet_name
+            )))
+        }
+    };
+
+    if !sheet.remove_pin(&pin_name) {
+        return Ok(CallToolResult::error(format!(
+            "Pin '{}' not found on sheet '{}'",
+            pin_name, sheet_name
+        )));
+    }
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "deleted_pin": pin_name,
+        "sheet": sheet_name
+    })))
+}
+
+async fn handle_validate_sheet_pins(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "schematic")?;
+
+    if !root_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Schematic '{}' not found",
+            root_path.display()
+        )));
+    }
+
+    let mut issues = Vec::new();
+    let mut visited = HashSet::new();
+    collect_pin_mismatches(&root_path, 0, &mut visited, &mut issues)?;
+
+    Ok(CallToolResult::json(&json!({
+        "issue_count": issues.len(),
+        "issues": issues
+    })))
+}
+
+fn collect_pin_mismatches(
+    path: &Path,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    issues: &mut Vec<Value>,
+) -> anyhow::Result<()> {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if depth > MAX_HIERARCHY_DEPTH || !visited.insert(canon.clone()) {
+        return Ok(());
+    }
+
+    let sch = match cse::Schematic::load(path) {
+        Ok(s) => s,
+        Err(_) => {
+            visited.remove(&canon);
+            return Ok(());
+        }
+    };
+    let dir = parent_dir(path);
+
+    for sheet in sch.sheets.iter() {
+        let child_path = dir.join(sheet.file());
+        if !child_path.exists() {
+            issues.push(json!({
+                "sheet": sheet.name(),
+                "file": sheet.file(),
+                "error": "child file not found on disk"
+            }));
+            continue;
+        }
+        let child = cse::Schematic::load(&child_path)?;
+        let label_names: HashSet<String> = child
+            .hierarchical_labels
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        let pin_names: HashSet<String> = sheet.pins.iter().map(|p| p.name.clone()).collect();
+
+        let labels_without_pins: Vec<&String> = label_names.difference(&pin_names).collect();
+        let pins_without_labels: Vec<&String> = pin_names.difference(&label_names).collect();
+
+        if !labels_without_pins.is_empty() || !pins_without_labels.is_empty() {
+            issues.push(json!({
+                "sheet": sheet.name(),
+                "file": sheet.file(),
+                "labels_without_pins": labels_without_pins,
+                "pins_without_labels": pins_without_labels
+            }));
+        }
+
+        collect_pin_mismatches(&child_path, depth + 1, visited, issues)?;
     }
     visited.remove(&canon);
     Ok(())
@@ -1395,5 +1836,311 @@ mod tests {
                 parent.sheets.by_name("Reused").unwrap().uuid.clone()
             })
         ));
+    }
+
+    // ─── PR-B: sheet pin lifecycle ─────────────────────────────────────────
+
+    fn add_label(sch_path: &Path, text: &str, shape: &str, x: f64, y: f64) {
+        let mut sch = cse::Schematic::load(sch_path).unwrap();
+        sch.add_hierarchical_label(text, shape, x, y);
+        sch.overwrite().unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_creates_matching_pins_from_labels() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "power.kicad_sch", "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let child_path = tmp.path().join("power.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        add_label(&child_path, "GND", "passive", 5.0, 10.0);
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("Power").unwrap();
+        assert_eq!(sheet.pins.len(), 2);
+        assert_eq!(sheet.pin_by_name("VIN").unwrap().pin_type, "input");
+        assert_eq!(sheet.pin_by_name("GND").unwrap().pin_type, "passive");
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_skips_already_imported_names() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "power.kicad_sch", "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let child_path = tmp.path().join("power.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+
+        handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert_eq!(parent.sheets.by_name("Power").unwrap().pins.len(), 1); // not duplicated
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_rejects_duplicate_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let args = json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "pin_type": "input", "x": 90.0, "y": 55.0 });
+        let result = handle_add_sheet_pin(&args, &ctx).await.unwrap();
+        assert!(!result.is_error);
+
+        let result2 = handle_add_sheet_pin(&args, &ctx).await.unwrap();
+        assert!(result2.is_error);
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_rejects_invalid_pin_type() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "pin_type": "not_a_type", "x": 90.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_renames_and_retypes() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "pin_type": "input", "x": 90.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "new_name": "VDD", "pin_type": "output" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        assert!(sheet.pin_by_name("VCC").is_none());
+        let renamed = sheet.pin_by_name("VDD").unwrap();
+        assert_eq!(renamed.pin_type, "output");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_with_no_fields_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "pin_type": "input", "x": 90.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn delete_sheet_pin_removes_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC", "pin_type": "input", "x": 90.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_delete_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "VCC" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert!(parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VCC")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_sheet_pin_not_found_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_delete_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "Nope" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn validate_sheet_pins_reports_mismatches() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "power.kicad_sch", "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let child_path = tmp.path().join("power.kicad_sch");
+        // Label with no pin, and (below) a pin with no label — deliberate mismatch.
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "pin_name": "GND", "pin_type": "passive", "x": 90.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result =
+            handle_validate_sheet_pins(&json!({ "schematic": root.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error);
+
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let report: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["issue_count"], 1);
+        let issue = &report["issues"][0];
+        assert_eq!(issue["sheet"], "Power");
+        assert!(issue["labels_without_pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "VIN"));
+        assert!(issue["pins_without_labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "GND"));
+    }
+
+    #[tokio::test]
+    async fn validate_sheet_pins_reports_no_issues_when_synced() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "power.kicad_sch", "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let child_path = tmp.path().join("power.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result =
+            handle_validate_sheet_pins(&json!({ "schematic": root.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let report: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["issue_count"], 0);
     }
 }
