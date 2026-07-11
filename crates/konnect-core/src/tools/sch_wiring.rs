@@ -933,11 +933,44 @@ async fn handle_add_power_symbol(
     sym.in_bom = true;
     sym.on_board = true;
     sym.uuid = uuid::Uuid::new_v4().to_string();
+    // Fields need explicit positions and hide flags: without an (at ...) KiCAD
+    // auto-places them (piling "#PWR..."/"PWR_FLAG" text mid-sheet), and the
+    // reference of a power symbol must be hidden like the GUI does.
+    use cse::sexp::{atom as satom, SexpNode as SN};
+    let field = |name: &str, value: &str, fx: f64, fy: f64, hide: bool| {
+        let mut prop = cse::Property::new(name, value);
+        prop.sub_nodes = vec![
+            SN::List(vec![
+                satom("at"),
+                satom(format!("{:.2}", fx)),
+                satom(format!("{:.2}", fy)),
+                satom("0"),
+            ]),
+            SN::List(vec![
+                satom("effects"),
+                SN::List(vec![
+                    satom("font"),
+                    SN::List(vec![satom("size"), satom("1.27"), satom("1.27")]),
+                ]),
+                SN::List(vec![satom("hide"), satom(if hide { "yes" } else { "no" })]),
+            ]),
+        ];
+        prop
+    };
+    // value text away from the glyph: below for rot 0 (arrow points up/down
+    // from the pin), above for rot 180, beside for 90/270
+    let (vx, vy) = match rotation as i64 {
+        180 => (x, y - 5.08),
+        90 => (x - 6.35, y),
+        270 => (x + 6.35, y),
+        _ => (x, y + 5.08),
+    };
     sym.properties
-        .push(cse::Property::new("Reference", &pwr_ref));
-    sym.properties.push(cse::Property::new("Value", &power_net));
-    sym.properties.push(cse::Property::new("Footprint", ""));
-    sym.properties.push(cse::Property::new("Datasheet", ""));
+        .push(field("Reference", &pwr_ref, x, y, true));
+    sym.properties
+        .push(field("Value", &power_net, vx, vy, false));
+    sym.properties.push(field("Footprint", "", x, y, true));
+    sym.properties.push(field("Datasheet", "", x, y, true));
 
     // Add instances raw node
     use cse::sexp::{atom, qstr, SexpNode};

@@ -267,13 +267,19 @@ impl Symbol {
     }
 
     pub fn move_to(&mut self, x: f64, y: f64) {
-        self.at.x = x;
-        self.at.y = y;
+        let (dx, dy) = (x - self.at.x, y - self.at.y);
+        self.translate(dx, dy);
     }
 
+    /// Move the symbol AND its property fields. Field positions are stored in
+    /// absolute canvas coordinates, so moving only the symbol origin strands
+    /// every Reference/Value label at the old location.
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.x += dx;
         self.at.y += dy;
+        for prop in self.properties.iter_mut() {
+            prop.translate(dx, dy);
+        }
     }
 
     pub fn set_rotation(&mut self, rot: f64) {

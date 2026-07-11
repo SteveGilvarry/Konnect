@@ -126,6 +126,27 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_open_viewer(args, ctx).await }
         ),
+        tool!(
+            "set_title_block",
+            "Fill the title block (Title / Date / Rev / Company / Comments) of a schematic. \
+             With recursive=true (default) the same title block is written to every sheet in \
+             the hierarchy. Only the fields you pass are changed; existing entries survive.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Root .kicad_sch file" },
+                    "title": { "type": "string" },
+                    "date": { "type": "string", "description": "e.g. 2026-07-11" },
+                    "rev": { "type": "string", "description": "e.g. A" },
+                    "company": { "type": "string" },
+                    "comment1": { "type": "string" },
+                    "comment2": { "type": "string" },
+                    "recursive": { "type": "boolean", "default": true }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_set_title_block(args, ctx).await }
+        ),
     ]
 }
 
@@ -525,4 +546,120 @@ mod tests {
             Some("file_not_found")
         );
     }
+}
+
+async fn handle_set_title_block(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_schematic_editor as cse;
+    use konnect_schematic_editor::sexp::{atom, qstr, SexpNode};
+    use std::collections::HashSet;
+
+    let root = get_path(args, "schematic")?;
+    let recursive = args["recursive"].as_bool().unwrap_or(true);
+    let fields: Vec<(&str, Option<&str>)> = vec![
+        ("title", args["title"].as_str()),
+        ("date", args["date"].as_str()),
+        ("rev", args["rev"].as_str()),
+        ("company", args["company"].as_str()),
+    ];
+    let comments: Vec<(usize, Option<&str>)> = vec![
+        (1, args["comment1"].as_str()),
+        (2, args["comment2"].as_str()),
+    ];
+
+    fn apply(
+        path: &std::path::Path,
+        fields: &[(&str, Option<&str>)],
+        comments: &[(usize, Option<&str>)],
+    ) -> anyhow::Result<()> {
+        let mut sch = cse::Schematic::load(path)?;
+        // find or create the title_block node in raw_other
+        let idx = match sch
+            .raw_other
+            .iter()
+            .position(|n| n.tag() == Some("title_block"))
+        {
+            Some(i) => i,
+            None => {
+                sch.raw_other
+                    .insert(0, SexpNode::List(vec![atom("title_block")]));
+                0
+            }
+        };
+        if let SexpNode::List(children) = &mut sch.raw_other[idx] {
+            let mut set = |tag: &str, extra: Option<usize>, value: &str| {
+                let matches = |c: &SexpNode| {
+                    c.tag() == Some(tag)
+                        && match extra {
+                            None => true,
+                            Some(n) => {
+                                c.args()
+                                    .first()
+                                    .and_then(|a| a.text())
+                                    .and_then(|t| t.parse::<usize>().ok())
+                                    == Some(n)
+                            }
+                        }
+                };
+                let mut node = vec![atom(tag)];
+                if let Some(n) = extra {
+                    node.push(atom(n.to_string()));
+                }
+                node.push(qstr(value.to_owned()));
+                let node = SexpNode::List(node);
+                match children.iter().position(|c| matches(c)) {
+                    Some(i) => children[i] = node,
+                    None => children.push(node),
+                }
+            };
+            for (tag, v) in fields {
+                if let Some(v) = v {
+                    set(tag, None, v);
+                }
+            }
+            for (n, v) in comments {
+                if let Some(v) = v {
+                    set("comment", Some(*n), v);
+                }
+            }
+        }
+        sch.overwrite()
+            .map_err(|e| anyhow::anyhow!("save failed: {e:?}"))
+    }
+
+    let mut files = vec![root.clone()];
+    if recursive {
+        // walk the hierarchy breadth-first
+        let mut queue = vec![root.clone()];
+        let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+        while let Some(f) = queue.pop() {
+            if !seen.insert(f.canonicalize().unwrap_or(f.clone())) {
+                continue;
+            }
+            if let Ok(sch) = cse::Schematic::load(&f) {
+                let dir = f
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf();
+                for sheet in sch.sheets.iter() {
+                    let child = dir.join(sheet.file());
+                    if child.exists() && !files.contains(&child) {
+                        files.push(child.clone());
+                        queue.push(child);
+                    }
+                }
+            }
+        }
+    }
+    let mut written = Vec::new();
+    for f in &files {
+        apply(f, &fields, &comments)?;
+        written.push(f.display().to_string());
+    }
+    Ok(CallToolResult::json(&json!({
+        "updated": written.len(),
+        "files": written
+    })))
 }

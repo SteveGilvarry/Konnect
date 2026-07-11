@@ -789,6 +789,64 @@ fn repair_walk(
         sym.clear_instances();
         sym.set_instance_path(project_name, prefix, &reference, unit);
         sym_count += 1;
+
+        // Power symbols written without field positions get auto-placed text
+        // piles by KiCAD; give them GUI-style positions and hide everything
+        // except the value.
+        if sym.lib_id.starts_with("power:") {
+            use cse::sexp::{atom, SexpNode};
+            let (x, y) = (sym.at.x, sym.at.y);
+            let rot = sym.at.rotation.unwrap_or(0.0) as i64;
+            let (vx, vy) = match rot {
+                180 => (x, y - 5.08),
+                90 => (x - 6.35, y),
+                270 => (x + 6.35, y),
+                _ => (x, y + 5.08),
+            };
+            let flag = sym.lib_id == "power:PWR_FLAG";
+            for prop in sym.properties.iter_mut() {
+                // PWR_FLAG glyphs are self-explanatory; their value text only
+                // collides with neighbours - force it hidden even when the
+                // field already has a position.
+                if flag && prop.name == "Value" {
+                    for n in prop.sub_nodes.iter_mut() {
+                        if n.tag() == Some("effects") {
+                            if let cse::sexp::SexpNode::List(c) = n {
+                                c.retain(|e| e.tag() != Some("hide"));
+                                c.push(cse::sexp::SexpNode::List(vec![
+                                    cse::sexp::atom("hide"),
+                                    cse::sexp::atom("yes"),
+                                ]));
+                            }
+                        }
+                    }
+                }
+                if prop.sub_nodes.iter().any(|n| n.tag() == Some("at")) {
+                    continue;
+                }
+                let visible = prop.name == "Value" && !flag;
+                let (fx, fy) = if visible { (vx, vy) } else { (x, y) };
+                prop.sub_nodes = vec![
+                    SexpNode::List(vec![
+                        atom("at"),
+                        atom(format!("{:.2}", fx)),
+                        atom(format!("{:.2}", fy)),
+                        atom("0"),
+                    ]),
+                    SexpNode::List(vec![
+                        atom("effects"),
+                        SexpNode::List(vec![
+                            atom("font"),
+                            SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+                        ]),
+                        SexpNode::List(vec![
+                            atom("hide"),
+                            atom(if visible { "no" } else { "yes" }),
+                        ]),
+                    ]),
+                ];
+            }
+        }
     }
 
     // Snapshot sheet data before recursing (needs `sch` unborrowed below).

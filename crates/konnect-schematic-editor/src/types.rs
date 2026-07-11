@@ -112,6 +112,31 @@ impl Property {
         children.extend(self.sub_nodes.iter().cloned());
         SexpNode::List(children)
     }
+
+    /// Shift this property's `(at x y rot)` position, if it has one.
+    /// Field positions are absolute canvas coordinates, so they must ride
+    /// along whenever their parent symbol moves.
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        for n in self.sub_nodes.iter_mut() {
+            if n.tag() != Some("at") {
+                continue;
+            }
+            if let SexpNode::List(c) = n {
+                let x = c
+                    .get(1)
+                    .and_then(|v| v.text())
+                    .and_then(|t| t.parse::<f64>().ok());
+                let y = c
+                    .get(2)
+                    .and_then(|v| v.text())
+                    .and_then(|t| t.parse::<f64>().ok());
+                if let (Some(x), Some(y)) = (x, y) {
+                    c[1] = atom(fmt_f64(x + dx));
+                    c[2] = atom(fmt_f64(y + dy));
+                }
+            }
+        }
+    }
 }
 
 // ---- Effects (preserved verbatim) ------------------------------------------
