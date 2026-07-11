@@ -257,33 +257,101 @@ async fn handle_download_jlcpcb(
         ));
     }
 
-    // JLCPCB parts database is distributed as a CSV or SQLite download.
-    // The official URL changes — we use a known community mirror format.
-    let url = "https://bouni.github.io/kicad-jlcpcb-tools/jlcpcb_parts.db";
+    // The kicad-jlcpcb-tools project distributes the parts database as a zip
+    // split into numbered chunks (parts-fts5.db.zip.001, .002, ...) because
+    // GitHub Pages caps file sizes. Fetch chunks until the first 404, then
+    // extract the FTS5 SQLite database from the reassembled zip.
+    const CHUNK_BASE: &str = "https://bouni.github.io/kicad-jlcpcb-tools/parts-fts5.db.zip";
+    const MAX_CHUNKS: usize = 64;
 
     if let Some(parent) = db_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    let zip_path = db_path.with_extension("db.zip.partial");
+    let _ = tokio::fs::remove_file(&zip_path).await;
 
+    // No global timeout: the archive is several GB. Rely on connect timeout
+    // and per-chunk progress instead.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let resp = get_with_backoff(&client, url).await?;
-    if !resp.status().is_success() {
+    let mut chunks = 0usize;
+    let mut zip_bytes = 0u64;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut zip_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&zip_path)
+            .await?;
+        for n in 1..=MAX_CHUNKS {
+            let url = format!("{}.{:03}", CHUNK_BASE, n);
+            let resp = get_with_backoff(&client, &url).await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                break;
+            }
+            if !resp.status().is_success() {
+                let _ = tokio::fs::remove_file(&zip_path).await;
+                return Ok(CallToolResult::error(format!(
+                    "Chunk {} download failed: HTTP {}",
+                    n,
+                    resp.status()
+                )));
+            }
+            let mut resp = resp;
+            while let Some(bytes) = resp.chunk().await? {
+                zip_bytes += bytes.len() as u64;
+                zip_file.write_all(&bytes).await?;
+            }
+            chunks += 1;
+            tracing::info!("JLCPCB db chunk {} fetched ({} bytes total)", n, zip_bytes);
+        }
+        zip_file.flush().await?;
+    }
+
+    if chunks == 0 {
+        let _ = tokio::fs::remove_file(&zip_path).await;
         return Ok(CallToolResult::error(format!(
-            "Download failed: HTTP {}",
-            resp.status()
+            "No database chunks found at {}.001 — distribution layout may have changed",
+            CHUNK_BASE
         )));
     }
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(&db_path, &bytes).await?;
+
+    // Extract the .db entry from the zip (sync zip crate, off the async runtime).
+    let db_tmp = db_path.with_extension("db.extracting");
+    let extracted = {
+        let zip_path = zip_path.clone();
+        let db_tmp = db_tmp.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let file = std::fs::File::open(&zip_path)?;
+            let mut archive = zip::ZipArchive::new(file)?;
+            let idx = (0..archive.len())
+                .find(|&i| {
+                    archive
+                        .by_index(i)
+                        .map(|f| f.name().ends_with(".db"))
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| anyhow::anyhow!("No .db entry in downloaded archive"))?;
+            let mut entry = archive.by_index(idx)?;
+            let mut out = std::fs::File::create(&db_tmp)?;
+            let n = std::io::copy(&mut entry, &mut out)?;
+            Ok(n)
+        })
+        .await??
+    };
+    tokio::fs::rename(&db_tmp, &db_path).await?;
+    let _ = tokio::fs::remove_file(&zip_path).await;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
             "success": true,
             "path": db_path.to_str().unwrap_or(""),
-            "size_bytes": bytes.len()
+            "chunks": chunks,
+            "downloaded_bytes": zip_bytes,
+            "size_bytes": extracted
         }))
         .unwrap(),
     ))
@@ -294,6 +362,85 @@ async fn handle_download_jlcpcb(
 /// and the query parameters that affect the result set.
 fn cache_key(tool: &str, db_path: &std::path::Path, parts: &[&str]) -> String {
     format!("{}|{}|{}", tool, db_path.display(), parts.join("|"))
+}
+
+// ─── JLCPCB database schema handling ─────────────────────────────────────────
+//
+// Two on-disk layouts exist:
+//  - Legacy: a plain `components` table (LCSC, MFR_Part, ... typed columns).
+//  - Current (kicad-jlcpcb-tools): an FTS5 virtual table `parts` with quoted
+//    column names ('LCSC Part', 'MFR.Part', 'Library Type', ...), a trigram
+//    tokenizer, plus `meta` / `categories` side tables. All values are text;
+//    Price is a tiered string like "1-49:0.182,50-249:0.143,...".
+
+#[derive(Clone, Copy, PartialEq)]
+enum DbFlavor {
+    Fts5,
+    Legacy,
+}
+
+fn detect_db_flavor(conn: &rusqlite::Connection) -> anyhow::Result<DbFlavor> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'parts'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if n > 0 { DbFlavor::Fts5 } else { DbFlavor::Legacy })
+}
+
+/// Price of the lowest-quantity bracket in a tiered price string
+/// ("1-49:0.182,50-249:0.143" → 0.182). Plain numeric strings pass through.
+fn parse_tier_price(price: &str) -> f64 {
+    let first = price.split(',').next().unwrap_or("");
+    first
+        .rsplit(':')
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Compose an FTS5 MATCH expression from free-text input: each whitespace
+/// token quoted (protects '-', '.', etc. from the FTS5 query parser) and
+/// AND-ed. The trigram tokenizer needs tokens of >= 3 chars; shorter tokens
+/// are dropped here and left to the caller's LIKE refinement.
+fn fts5_match_expr(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|t| t.chars().count() >= 3)
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+const FTS5_COLS: &str = "\"LCSC Part\", \"MFR.Part\", Package, Manufacturer, \"Library Type\", \
+                         Description, Price, Stock";
+
+fn fts5_row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    // Every column may hold TEXT (FTS5 stores what it was given) — go through
+    // Value to be lossless regardless of the stored type.
+    let s = |idx: usize| -> String {
+        match row.get_ref(idx) {
+            Ok(v) => match v {
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
+    };
+    let price_str = s(6);
+    Ok(json!({
+        "lcsc": s(0),
+        "mpn": s(1),
+        "package": s(2),
+        "manufacturer": s(3),
+        "library_type": s(4),
+        "description": s(5),
+        "price": parse_tier_price(&price_str),
+        "price_tiers": price_str,
+        "stock": s(7).parse::<i64>().unwrap_or(0)
+    }))
 }
 
 async fn handle_search_jlcpcb_parts(
@@ -335,37 +482,79 @@ async fn handle_search_jlcpcb_parts(
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = rusqlite::Connection::open(&db_path)?;
 
-        // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
-        // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
-        let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
-             FROM components WHERE (Description LIKE ?1 OR MFR_Part LIKE ?1)"
-        );
-        if basic_only {
-            sql.push_str(" AND Library_Type = 'Basic'");
-        }
-        if in_stock {
-            sql.push_str(" AND Stock > 0");
-        }
-        if let Some(ref _cat) = category {
-            sql.push_str(" AND Category LIKE ?2");
-        }
-        sql.push_str(&format!(" LIMIT {}", limit));
+        match detect_db_flavor(&conn)? {
+            DbFlavor::Fts5 => {
+                let match_expr = fts5_match_expr(&query);
+                if match_expr.is_empty() {
+                    anyhow::bail!(
+                        "Query needs at least one term of 3+ characters \
+                         (trigram full-text index)"
+                    );
+                }
+                let mut sql = format!(
+                    "SELECT {FTS5_COLS} FROM parts WHERE parts MATCH ?1"
+                );
+                if basic_only {
+                    sql.push_str(" AND \"Library Type\" = 'Basic'");
+                }
+                if in_stock {
+                    sql.push_str(" AND CAST(Stock AS INTEGER) > 0");
+                }
+                if category.is_some() {
+                    sql.push_str(
+                        " AND (\"First Category\" LIKE ?2 OR \"Second Category\" LIKE ?2)",
+                    );
+                }
+                sql.push_str(&format!(" ORDER BY rank LIMIT {}", limit));
 
-        let like_query = format!("%{}%", query);
-        let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare(&sql)?;
+                let rows: Vec<serde_json::Value> = if let Some(cat) = &category {
+                    let cat_like = format!("%{}%", cat);
+                    stmt.query_map(
+                        rusqlite::params![match_expr, cat_like],
+                        fts5_row_to_part_json,
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                } else {
+                    stmt.query_map(rusqlite::params![match_expr], fts5_row_to_part_json)?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                };
+                Ok(rows)
+            }
+            DbFlavor::Legacy => {
+                let mut sql = String::from(
+                    "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+                     FROM components WHERE (Description LIKE ?1 OR MFR_Part LIKE ?1)"
+                );
+                if basic_only {
+                    sql.push_str(" AND Library_Type = 'Basic'");
+                }
+                if in_stock {
+                    sql.push_str(" AND Stock > 0");
+                }
+                if let Some(ref _cat) = category {
+                    sql.push_str(" AND Category LIKE ?2");
+                }
+                sql.push_str(&format!(" LIMIT {}", limit));
 
-        let rows: Vec<serde_json::Value> = if category.is_some() {
-            let cat_like = format!("%{}%", category.as_deref().unwrap_or(""));
-            stmt.query_map(rusqlite::params![like_query, cat_like], row_to_part_json)?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map(rusqlite::params![like_query], row_to_part_json)?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        Ok(rows)
+                let like_query = format!("%{}%", query);
+                let mut stmt = conn.prepare(&sql)?;
+
+                let rows: Vec<serde_json::Value> = if category.is_some() {
+                    let cat_like = format!("%{}%", category.as_deref().unwrap_or(""));
+                    stmt.query_map(rusqlite::params![like_query, cat_like], row_to_part_json)?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                } else {
+                    stmt.query_map(rusqlite::params![like_query], row_to_part_json)?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                };
+                Ok(rows)
+            }
+        }
     })
     .await??;
 
@@ -421,12 +610,31 @@ async fn handle_get_jlcpcb_part(
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
             let conn = rusqlite::Connection::open(&db_path)?;
-            let mut stmt = conn.prepare(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
-             FROM components WHERE LCSC = ?1 LIMIT 1"
-        )?;
-            let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
-            Ok(rows.next().and_then(|r| r.ok()))
+            match detect_db_flavor(&conn)? {
+                DbFlavor::Fts5 => {
+                    // MATCH narrows via the trigram index (an equality scan on
+                    // an FTS5 column would walk all ~7M rows), then the exact
+                    // comparison picks the precise part.
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT {FTS5_COLS} FROM parts \
+                         WHERE parts MATCH ?1 AND \"LCSC Part\" = ?2 LIMIT 1"
+                    ))?;
+                    let match_expr = format!("\"{}\"", lcsc_id.replace('"', ""));
+                    let mut rows = stmt.query_map(
+                        rusqlite::params![match_expr, lcsc_id],
+                        fts5_row_to_part_json,
+                    )?;
+                    Ok(rows.next().and_then(|r| r.ok()))
+                }
+                DbFlavor::Legacy => {
+                    let mut stmt = conn.prepare(
+                        "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+                         FROM components WHERE LCSC = ?1 LIMIT 1"
+                    )?;
+                    let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
+                    Ok(rows.next().and_then(|r| r.ok()))
+                }
+            }
         })
         .await??;
 
@@ -491,24 +699,63 @@ async fn handle_suggest_alternatives(
 
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = rusqlite::Connection::open(&db_path)?;
-        let like_val = format!("%{}%", value);
-        let like_pkg = format!("%{}%", package_hint);
 
-        let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
-             FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
-        );
-        if let Some(max_p) = max_price {
-            sql.push_str(&format!(" AND Price <= {}", max_p));
+        match detect_db_flavor(&conn)? {
+            DbFlavor::Fts5 => {
+                // Narrow with the trigram index on value + package hint, then
+                // rank by parsed lowest-bracket price in Rust (Price is a
+                // tiered string, not sortable in SQL).
+                let match_expr =
+                    fts5_match_expr(&format!("{} {}", value, package_hint));
+                if match_expr.is_empty() {
+                    anyhow::bail!(
+                        "value/footprint need at least one term of 3+ characters"
+                    );
+                }
+                let sql = format!(
+                    "SELECT {FTS5_COLS} FROM parts \
+                     WHERE parts MATCH ?1 AND CAST(Stock AS INTEGER) > 0 \
+                     LIMIT {}",
+                    limit * 10
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut rows: Vec<serde_json::Value> = stmt
+                    .query_map(rusqlite::params![match_expr], fts5_row_to_part_json)?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if let Some(max_p) = max_price {
+                    rows.retain(|r| r["price"].as_f64().unwrap_or(f64::MAX) <= max_p);
+                }
+                rows.sort_by(|a, b| {
+                    a["price"]
+                        .as_f64()
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&b["price"].as_f64().unwrap_or(f64::MAX))
+                });
+                rows.truncate(limit);
+                Ok(rows)
+            }
+            DbFlavor::Legacy => {
+                let like_val = format!("%{}%", value);
+                let like_pkg = format!("%{}%", package_hint);
+
+                let mut sql = String::from(
+                    "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+                     FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
+                );
+                if let Some(max_p) = max_price {
+                    sql.push_str(&format!(" AND Price <= {}", max_p));
+                }
+                sql.push_str(&format!(" ORDER BY Price ASC LIMIT {}", limit));
+
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![like_val, like_pkg], row_to_part_json)?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            }
         }
-        sql.push_str(&format!(" ORDER BY Price ASC LIMIT {}", limit));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params![like_val, like_pkg], row_to_part_json)?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
     })
     .await??;
 
@@ -544,12 +791,40 @@ async fn handle_jlcpcb_stats(
     let meta = tokio::fs::metadata(&db_path).await?;
     let size_bytes = meta.len();
 
-    let count = tokio::task::spawn_blocking({
+    let (count, last_update) = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
-        move || -> anyhow::Result<i64> {
+        move || -> anyhow::Result<(i64, Option<String>)> {
             let conn = rusqlite::Connection::open(&db_path)?;
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM components", [], |r| r.get(0))?;
-            Ok(count)
+            match detect_db_flavor(&conn)? {
+                DbFlavor::Fts5 => {
+                    // The distribution's meta table carries the authoritative
+                    // part count and snapshot date — COUNT(*) on a multi-GB
+                    // FTS5 table is needlessly slow.
+                    let row = conn.query_row(
+                        "SELECT CAST(partcount AS INTEGER), CAST(last_update AS TEXT) FROM meta LIMIT 1",
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0).unwrap_or(0),
+                                r.get::<_, String>(1).ok(),
+                            ))
+                        },
+                    );
+                    match row {
+                        Ok((c, d)) => Ok((c, d)),
+                        Err(_) => {
+                            let c: i64 =
+                                conn.query_row("SELECT COUNT(*) FROM parts", [], |r| r.get(0))?;
+                            Ok((c, None))
+                        }
+                    }
+                }
+                DbFlavor::Legacy => {
+                    let c: i64 =
+                        conn.query_row("SELECT COUNT(*) FROM components", [], |r| r.get(0))?;
+                    Ok((c, None))
+                }
+            }
         }
     })
     .await??;
@@ -559,7 +834,8 @@ async fn handle_jlcpcb_stats(
             "exists": true,
             "path": db_path.to_str().unwrap_or(""),
             "size_bytes": size_bytes,
-            "part_count": count
+            "part_count": count,
+            "last_update": last_update
         }))
         .unwrap(),
     ))
