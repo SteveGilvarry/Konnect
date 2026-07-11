@@ -286,7 +286,7 @@ pub fn tools() -> Vec<ToolDef> {
 
 async fn handle_create_footprint(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output")?;
     let name = args["name"].as_str().unwrap_or("Footprint");
@@ -324,7 +324,7 @@ async fn handle_create_footprint(
 
     let content = format!(
         r#"(footprint "{}"
-  (version 20240108)
+  (version 20260206)
   (generator "konnect")
   (layer "F.Cu")
   (descr "{}")
@@ -345,6 +345,7 @@ async fn handle_create_footprint(
         tokio::fs::create_dir_all(parent).await?;
     }
     write_atomic(&output, &content)?;
+    normalize_with_kicad_cli(&ctx.config.kicad_cli, "fp", &output).await;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -841,9 +842,26 @@ async fn register_in_lib_table(
 
 // ─── Symbol library tools ─────────────────────────────────────────────────────
 
+/// Best-effort normalization of a freshly written library file to the current
+/// KiCad format via `kicad-cli sym|fp upgrade --force`. Konnect's templates
+/// carry the right format version, but KiCad normalizes more than the version
+/// header on load (default fields, node order); files that skip this step can
+/// trigger lib_symbol_mismatch ERC warnings against embedded copies. Silently
+/// skipped when kicad-cli is not configured or the invocation fails.
+async fn normalize_with_kicad_cli(cli: &str, kind: &str, path: &Path) {
+    if cli.is_empty() {
+        return;
+    }
+    let _ = tokio::process::Command::new(cli)
+        .args([kind, "upgrade", "--force"])
+        .arg(path)
+        .output()
+        .await;
+}
+
 async fn handle_create_symbol(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
     let name = args["name"].as_str().unwrap_or("Symbol");
@@ -932,7 +950,7 @@ async fn handle_create_symbol(
     let content = if lib_path.exists() {
         tokio::fs::read_to_string(&lib_path).await?
     } else {
-        "(kicad_symbol_lib\n  (version 20240108)\n  (generator \"kicad-mcp\")\n)\n".to_string()
+        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"konnect\")\n)\n".to_string()
     };
 
     // Insert before closing paren of root expression
@@ -943,6 +961,7 @@ async fn handle_create_symbol(
         tokio::fs::create_dir_all(parent).await?;
     }
     write_atomic(&lib_path, &new_content)?;
+    normalize_with_kicad_cli(&ctx.config.kicad_cli, "sym", &lib_path).await;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
