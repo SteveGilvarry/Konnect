@@ -52,6 +52,46 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_connect_to_net(args, ctx).await }
         ),
         tool!(
+            "fanout_pins",
+            "Wire many pins to nets in one call: for each {reference, pin_number, net} a wire \
+             stub is routed away from the symbol body (direction inferred from pin orientation) \
+             and a correctly-justified label placed at its end. Junction dots are added where \
+             stubs meet existing wires. Single atomic file write — covers the common case of \
+             fanning a component's pins out to named nets.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "pins": {
+                        "type": "array",
+                        "description": "List of pin→net assignments",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "pin_number": { "type": "string" },
+                                "net": { "type": "string" },
+                                "label_type": {
+                                    "type": "string",
+                                    "enum": ["net_label", "global_label"],
+                                    "default": "net_label"
+                                },
+                                "stub_length": { "type": "number", "default": 2.54 },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["right", "left", "up", "down"],
+                                    "description": "Override the inferred stub direction"
+                                }
+                            },
+                            "required": ["reference", "pin_number", "net"]
+                        }
+                    }
+                },
+                "required": ["schematic", "pins"]
+            }),
+            |args, ctx| async move { handle_fanout_pins(args, ctx).await }
+        ),
+        tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
              or component reference designator — single file write.",
@@ -383,6 +423,122 @@ async fn handle_batch_connect_to_net(
         "net": net_name,
         "added": added,
         "added_count": added.len(),
+        "errors": errors
+    })))
+}
+
+async fn handle_fanout_pins(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_sexp::schematic::{
+        format_global_label, format_junction, pin_body_vector, resolve_lib_pins_for_unit,
+    };
+
+    let sch_path = get_path(args, "schematic")?;
+    let pins = match args["pins"].as_array() {
+        Some(a) => a.clone(),
+        None => return Ok(CallToolResult::error("Missing 'pins' array")),
+    };
+
+    let (content, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let existing_wires = extract_wires(&tree);
+
+    let mut inserts = String::new();
+    let mut new_wires: Vec<konnect_sexp::schematic::Wire> = Vec::new();
+    let mut added: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for spec in &pins {
+        let (Some(reference), Some(pin_number), Some(net)) = (
+            spec["reference"].as_str(),
+            spec["pin_number"].as_str(),
+            spec["net"].as_str(),
+        ) else {
+            errors.push(format!("Spec missing reference/pin_number/net: {}", spec));
+            continue;
+        };
+        let stub = spec["stub_length"].as_f64().unwrap_or(2.54);
+        let label_type = spec["label_type"].as_str().unwrap_or("net_label");
+
+        // A multi-unit part has one instance per unit sharing the reference;
+        // find the instance whose unit actually owns this pin number.
+        let mut hit: Option<(f64, f64, f64, f64)> = None; // px, py, away_dx, away_dy
+        for inst in instances.iter().filter(|i| i.reference == reference) {
+            let t = inst.pin_transform();
+            if let Some(p) = resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit)
+                .into_iter()
+                .find(|p| p.number == pin_number)
+            {
+                let (px, py) = pin_endpoint(&p, t);
+                let (bx, by) = pin_body_vector(&p, t);
+                hit = Some((px, py, -bx, -by));
+                break;
+            }
+        }
+        let Some((px, py, adx, ady)) = hit else {
+            errors.push(format!("Pin '{}' not found on '{}'", pin_number, reference));
+            continue;
+        };
+
+        let direction = match spec["direction"].as_str() {
+            Some(d) => d,
+            None => {
+                if adx.abs() >= ady.abs() {
+                    if adx >= 0.0 { "right" } else { "left" }
+                } else if ady >= 0.0 {
+                    "down"
+                } else {
+                    "up"
+                }
+            }
+        };
+        let (lx, ly, rot) = match direction {
+            "left" => (px - stub, py, 180.0),
+            "up" => (px, py - stub, 90.0),
+            "down" => (px, py + stub, 270.0),
+            _ => (px + stub, py, 0.0),
+        };
+
+        inserts.push_str(&format_wire(px, py, lx, ly));
+        new_wires.push(konnect_sexp::schematic::Wire {
+            x1: px,
+            y1: py,
+            x2: lx,
+            y2: ly,
+            uuid: None,
+        });
+        inserts.push_str(&match label_type {
+            "global_label" => format_global_label(net, "input", lx, ly, rot),
+            _ => format_net_label(net, lx, ly, rot),
+        });
+        added.push(json!({
+            "reference": reference, "pin": pin_number, "net": net,
+            "direction": direction, "label": { "x": lx, "y": ly, "rotation": rot }
+        }));
+    }
+
+    // Junctions where the new stubs land on existing wires (or each other).
+    let mut all_wires = existing_wires;
+    all_wires.extend(new_wires);
+    for (jx, jy) in konnect_sexp::schematic::find_t_junctions(&all_wires, 0.01) {
+        inserts.push_str(&format_junction(jx, jy));
+    }
+
+    if !inserts.is_empty() {
+        let close_pos = content.rfind(')').unwrap_or(content.len());
+        let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, inserts)]);
+        write_atomic(&sch_path, &new_content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "fanned_out": added.len(),
+        "pins": added,
         "errors": errors
     })))
 }

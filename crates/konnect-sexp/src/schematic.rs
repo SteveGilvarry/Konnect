@@ -451,14 +451,43 @@ pub fn format_junction(x: f64, y: f64) -> String {
     )
 }
 
-pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
+/// Serialize a global label node. Justify tracks rotation like local labels.
+pub fn format_global_label(net: &str, shape: &str, x: f64, y: f64, rotation: f64) -> String {
     let uuid = crate::writer::new_uuid();
+    let justify = if (rotation - 180.0).abs() < 0.1 || (rotation - 270.0).abs() < 0.1 {
+        "right"
+    } else {
+        "left"
+    };
     format!(
         r#"
-  (net_label "{net}"
+  (global_label "{net}"
+    (shape {shape})
+    (at {x} {y} {rotation})
+    (effects
+      (font
+        (size 1.27 1.27))
+      (justify {justify}))
+    (uuid "{uuid}"))"#
+    )
+}
+
+pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
+    // Local labels are `(label ...)` in the KiCad format — there is no
+    // `(net_label ...)` node. Justify must track rotation so text extends in
+    // reading direction away from the anchor (180/270 anchor at text end).
+    let uuid = crate::writer::new_uuid();
+    let justify = if (rotation - 180.0).abs() < 0.1 || (rotation - 270.0).abs() < 0.1 {
+        "right"
+    } else {
+        "left"
+    };
+    format!(
+        r#"
+  (label "{net}"
     (at {x} {y} {rotation})
     (fields_autoplaced yes)
-    (effects (font (size 1.27 1.27)) (justify left))
+    (effects (font (size 1.27 1.27)) (justify {justify}))
     (uuid "{uuid}")
   )"#
     )
