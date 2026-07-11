@@ -15,6 +15,26 @@ use anyhow::{Context, Result};
 use prost::Message;
 use tracing::{debug, warn};
 
+/// Marker error: there is no usable IPC transport at all — either no socket
+/// path is configured or nothing is listening at the configured address.
+///
+/// Tools use this (via [`is_unavailable`]) to distinguish "KiCAD isn't
+/// running, a file-based fallback is safe" from "a live KiCAD session
+/// answered but the call failed" — the latter must NEVER silently fall back
+/// to editing the .kicad_pcb file behind the live session's back.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct IpcUnavailable(pub String);
+
+/// True if `err` (anywhere in its chain) is an [`IpcUnavailable`] transport
+/// error — i.e. no socket configured / nothing listening. Application-level
+/// failures from a live KiCAD (bad request, no board open, timeouts from a
+/// wedged-but-present session) return false.
+pub fn is_unavailable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<IpcUnavailable>().is_some())
+}
+
 /// Converts KiCAD nanometers to millimeters.
 fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
@@ -76,6 +96,41 @@ fn default_socket_path() -> Option<String> {
     None
 }
 
+/// Extract a Field's display text (fields nest Field → BoardText → Text).
+fn field_text(field: Option<&kiapi::board::types::Field>) -> String {
+    field
+        .and_then(|f| f.text.as_ref())
+        .and_then(|bt| bt.text.as_ref())
+        .map(|t| t.text.clone())
+        .unwrap_or_default()
+}
+
+/// Convert a decoded FootprintInstance protobuf to the tool-facing summary.
+fn fp_instance_to_ipc(fp: &kiapi::board::types::FootprintInstance) -> IpcFootprint {
+    let pos = fp.position.as_ref();
+    let lib_id = fp
+        .definition
+        .as_ref()
+        .and_then(|d| d.id.as_ref())
+        .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+        .unwrap_or_default();
+    IpcFootprint {
+        reference: field_text(fp.reference_field.as_ref()),
+        value: field_text(fp.value_field.as_ref()),
+        footprint: lib_id,
+        position: IpcVector2 {
+            x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+            y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+        },
+        rotation: fp
+            .orientation
+            .as_ref()
+            .map(|a| a.value_degrees)
+            .unwrap_or(0.0),
+        layer: layer_enum_to_name(fp.layer).to_string(),
+    }
+}
+
 pub struct KiCadIpcClient {
     socket_path: String,
     client_name: String,
@@ -113,7 +168,7 @@ impl KiCadIpcClient {
         type_name: &str,
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
-            anyhow::bail!(
+            return Err(anyhow::Error::new(IpcUnavailable(
                 "KiCAD IPC socket path not configured. To fix: \
                  (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
                  and copy the listed ipc:// address; \
@@ -123,7 +178,8 @@ impl KiCadIpcClient {
                  Alternatively set ipc_socket_path in konnect-settings.json or launch \
                  via KiCAD (which sets KICAD_API_SOCKET). \
                  Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
-            );
+                    .to_string(),
+            )));
         }
 
         let request = kiapi::common::ApiRequest {
@@ -166,9 +222,14 @@ impl KiCadIpcClient {
                 format!("ipc://{}", self.socket_path)
             };
 
-        socket
-            .dial(&dial_url)
-            .with_context(|| format!("Cannot connect to KiCAD IPC at {}", dial_url))?;
+        // Dial failure = nothing listening: classified as transport-unavailable
+        // so tools may fall back to file editing.
+        socket.dial(&dial_url).map_err(|e| {
+            anyhow::Error::new(IpcUnavailable(format!(
+                "Cannot connect to KiCAD IPC at {}: {}",
+                dial_url, e
+            )))
+        })?;
 
         // Send request
         let msg = nng::Message::from(request_bytes.as_slice());
@@ -291,48 +352,14 @@ impl KiCadIpcClient {
     /// List all footprints on the board.
     pub fn list_footprints(&self) -> Result<Vec<IpcFootprint>> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        let mut footprints = Vec::new();
-        for item in &items {
-            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
-                let pos = fp.position.as_ref();
-                let ref_text = fp
-                    .reference_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                let val_text = fp
-                    .value_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                let lib_id = fp
-                    .definition
-                    .as_ref()
-                    .and_then(|d| d.id.as_ref())
-                    .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
-                    .unwrap_or_default();
-                footprints.push(IpcFootprint {
-                    reference: ref_text,
-                    value: val_text,
-                    footprint: lib_id,
-                    position: IpcVector2 {
-                        x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                        y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
-                    },
-                    rotation: fp
-                        .orientation
-                        .as_ref()
-                        .map(|a| a.value_degrees)
-                        .unwrap_or(0.0),
-                    layer: layer_enum_to_name(fp.layer).to_string(),
-                });
-            }
-        }
-        Ok(footprints)
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                    .ok()
+                    .map(|fp| fp_instance_to_ipc(&fp))
+            })
+            .collect())
     }
 
     /// Create items on the board.
@@ -457,6 +484,124 @@ impl KiCadIpcClient {
     pub fn get_footprint(&self, reference: &str) -> Result<Option<IpcFootprint>> {
         let footprints = self.list_footprints()?;
         Ok(footprints.into_iter().find(|fp| fp.reference == reference))
+    }
+
+    /// Find the raw FootprintInstance protobuf for a reference designator.
+    fn find_footprint_instance(
+        &self,
+        reference: &str,
+    ) -> Result<Option<kiapi::board::types::FootprintInstance>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+                if field_text(fp.reference_field.as_ref()) == reference {
+                    return Ok(Some(fp));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return a footprint summary plus its pads (pad positions are relative
+    /// to the footprint origin, matching the .kicad_pcb file convention).
+    /// Pads live inside the FootprintInstance's embedded definition as packed
+    /// `kiapi.board.types.Pad` items.
+    pub fn get_footprint_pads(
+        &self,
+        reference: &str,
+    ) -> Result<Option<(IpcFootprint, Vec<IpcPad>)>> {
+        let fp = match self.find_footprint_instance(reference)? {
+            Some(fp) => fp,
+            None => return Ok(None),
+        };
+        let mut pads = Vec::new();
+        if let Some(def) = &fp.definition {
+            for item in &def.items {
+                if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                    continue;
+                }
+                if let Ok(pad) = kiapi::board::types::Pad::decode(item.value.as_slice()) {
+                    let pos = pad.position.as_ref();
+                    pads.push(IpcPad {
+                        number: pad.number.clone(),
+                        position: IpcVector2 {
+                            x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                            y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                        },
+                        net: pad.net.as_ref().map(|n| n.name.clone()).unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        Ok(Some((fp_instance_to_ipc(&fp), pads)))
+    }
+
+    /// Set a footprint's Value field text via UpdateItems.
+    pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<IpcFootprint> {
+        let mut fp = self
+            .find_footprint_instance(reference)?
+            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on board", reference))?;
+        let text = fp
+            .value_field
+            .as_mut()
+            .and_then(|f| f.text.as_mut())
+            .and_then(|bt| bt.text.as_mut())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Footprint '{}' has no editable Value field", reference)
+            })?;
+        text.text = value.to_string();
+        let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+        self.update_items(vec![any])?;
+        Ok(fp_instance_to_ipc(&fp))
+    }
+
+    /// Save a copy of the open board to `path` without switching documents
+    /// (SaveCopyOfDocument). Used to hand live IPC-edited state to file-based
+    /// consumers (kicad-cli render/DRC) without touching the user's file.
+    pub fn save_copy_of_board(&self, path: &str) -> Result<()> {
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::common::commands::SaveCopyOfDocument {
+            document: Some(doc),
+            path: path.to_string(),
+            options: Some(kiapi::common::commands::SaveOptions {
+                overwrite: true,
+                include_project: false,
+            }),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.SaveCopyOfDocument")?;
+        Ok(())
+    }
+
+    /// Fetch the open board's title block (title, date, revision, company).
+    pub fn get_title_block_info(&self) -> Result<IpcTitleBlock> {
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::common::commands::GetTitleBlockInfo {
+            document: Some(doc),
+        };
+        let resp_any = self.send_command(&cmd, "kiapi.common.commands.GetTitleBlockInfo")?;
+        let any = resp_any.ok_or_else(|| anyhow::anyhow!("No title block returned"))?;
+        let tb: kiapi::common::types::TitleBlockInfo = unpack_any(&any)?;
+        Ok(IpcTitleBlock {
+            title: tb.title,
+            date: tb.date,
+            revision: tb.revision,
+            company: tb.company,
+        })
+    }
+
+    /// Set the active layer in the board editor.
+    pub fn set_active_layer(&self, layer_name: &str) -> Result<()> {
+        let layer = crate::builders::layer_from_name(layer_name);
+        if layer == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown or unsupported layer name '{}'", layer_name);
+        }
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::board::commands::SetActiveLayer {
+            board: Some(doc),
+            layer: layer as i32,
+        };
+        self.send_command(&cmd, "kiapi.board.commands.SetActiveLayer")?;
+        Ok(())
     }
 
     /// Find a footprint's KIID by reference.

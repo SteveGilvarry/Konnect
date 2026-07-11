@@ -16,6 +16,25 @@ pub struct IpcFootprint {
     pub layer: String,
 }
 
+/// A pad on a footprint. `position` is relative to the parent footprint's
+/// origin (unrotated), matching both the IPC API and .kicad_pcb file
+/// conventions — callers transform to board space with the footprint's
+/// position and rotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcPad {
+    pub number: String,
+    pub position: IpcVector2,
+    pub net: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcTitleBlock {
+    pub title: String,
+    pub date: String,
+    pub revision: String,
+    pub company: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
     pub net_name: String,
