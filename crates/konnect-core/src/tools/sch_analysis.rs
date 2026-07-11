@@ -576,18 +576,60 @@ async fn handle_find_orphan_items(
     let wires = super::sch_bridge::all_wires_as_sexp(&sch);
     let labels = super::sch_bridge::all_labels_as_sexp(&sch);
     let label_pts: HashSet<(i64, i64)> = labels.iter().map(|l| pt_key(l.x, l.y)).collect();
+
+    // A wire end is terminated by: another wire end, a label, a symbol pin
+    // (incl. power symbols), a junction, a no_connect, or landing mid-segment
+    // on another wire (T-junction). Anything else is dangling.
+    let (_, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let mut term_pts: HashSet<(i64, i64)> = HashSet::new();
+    for inst in &instances {
+        let t = inst.pin_transform();
+        for pin in konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit)
+        {
+            let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, t);
+            term_pts.insert(pt_key(px, py));
+        }
+    }
+    for node_name in ["junction", "no_connect"] {
+        for n in tree.find_all(node_name) {
+            if let Some(at) = n.find("at") {
+                if let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) {
+                    term_pts.insert(pt_key(x, y));
+                }
+            }
+        }
+    }
+
     let mut endpoint_counts: HashMap<(i64, i64), usize> = HashMap::new();
     for w in &wires {
         *endpoint_counts.entry(pt_key(w.x1, w.y1)).or_insert(0) += 1;
         *endpoint_counts.entry(pt_key(w.x2, w.y2)).or_insert(0) += 1;
     }
+    let on_other_wire = |x: f64, y: f64| -> bool {
+        wires.iter().any(|w| {
+            !(points_coincident(w.x1, w.y1, x, y, 0.01) || points_coincident(w.x2, w.y2, x, y, 0.01))
+                && point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, 0.05)
+        })
+    };
     let dangling: Vec<serde_json::Value> = endpoint_counts.iter()
-        .filter(|(k, &c)| c == 1 && !label_pts.contains(k))
+        .filter(|(k, &c)| c == 1 && !label_pts.contains(k) && !term_pts.contains(k))
+        .filter(|(k, _)| !on_other_wire(k.0 as f64 / 1000.0, k.1 as f64 / 1000.0))
         .map(|(k, _)| json!({ "type": "dangling_wire_end", "x": k.0 as f64/1000.0, "y": k.1 as f64/1000.0 }))
         .collect();
+    // A label directly on a pin (no wire stub) is attached, not floating.
     let floating: Vec<serde_json::Value> = labels
         .iter()
-        .filter(|l| !endpoint_counts.contains_key(&pt_key(l.x, l.y)))
+        .filter(|l| {
+            let k = pt_key(l.x, l.y);
+            !endpoint_counts.contains_key(&k)
+                && !term_pts.contains(&k)
+                && !on_other_wire(l.x, l.y)
+        })
         .map(|l| json!({ "type": "floating_label", "net": l.net, "x": l.x, "y": l.y }))
         .collect();
     let mut all = dangling;
