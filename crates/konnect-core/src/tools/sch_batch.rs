@@ -266,6 +266,36 @@ fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usi
     Some((val_start, val_end))
 }
 
+/// Build an insertion edit that adds a new hidden `(property ...)` node to the
+/// symbol identified by `reference`. Used when a field named in an edit spec does
+/// not exist yet (e.g. stamping MPN/LCSC fields). The property is placed at the
+/// symbol origin, hidden, and inserted just before the `(instances` node so the
+/// file stays in canonical property order.
+fn insert_property_edit(
+    content: &str,
+    reference: &str,
+    field: &str,
+    value: &str,
+) -> Option<SexpEdit> {
+    let (sym_start, sym_end) = find_symbol_block(content, reference)?;
+    let sym_block = &content[sym_start..sym_end];
+    // Symbol origin from the block's own "(at X Y ...)" node.
+    let at_rest = &sym_block[sym_block.find("(at ")? + 4..];
+    let mut it = at_rest.split_whitespace();
+    let x = it.next()?.trim_end_matches(')');
+    let y = it.next()?.trim_end_matches(')');
+    let offset = match sym_block.find("\n    (instances") {
+        Some(rel) => sym_start + rel,
+        // No instances node: insert before the block's closing paren.
+        None => sym_end - 1,
+    };
+    let esc = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let prop = format!(
+        "\n    (property \"{field}\" \"{esc}\"\n      (at {x} {y} 0)\n      (effects\n        (font\n          (size 1.27 1.27))\n        (hide yes)))"
+    );
+    Some(SexpEdit::insert(offset, prop))
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_batch_connect_to_net(
@@ -579,10 +609,17 @@ async fn handle_batch_edit(
                             file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
                             component_changes.push(format!("{} → {}", field_name, new_val));
                         }
-                        None => errors.push(format!(
-                            "Field '{}' not found on '{}'",
-                            field_name, reference
-                        )),
+                        None => match insert_property_edit(&content, reference, field_name, new_val)
+                        {
+                            Some(edit) => {
+                                file_edits.push(edit);
+                                component_changes.push(format!("{} + {}", field_name, new_val));
+                            }
+                            None => errors.push(format!(
+                                "Symbol '{}' not found for new field '{}'",
+                                reference, field_name
+                            )),
+                        },
                     }
                 }
             }
