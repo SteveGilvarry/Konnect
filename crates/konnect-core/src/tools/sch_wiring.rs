@@ -8,7 +8,7 @@ use crate::tool;
 use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::snap_point,
+    geometry::{points_coincident, snap_point},
     schematic::{
         extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
         pin_endpoint, read_schematic,
@@ -296,9 +296,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "net": { "type": "string" },
                     "direction": {
                         "type": "string",
-                        "description": "Direction to route the wire stub: 'right' (default), 'left', 'up', 'down'",
-                        "enum": ["right", "left", "up", "down"],
-                        "default": "right"
+                        "description": "Direction to route the wire stub: 'right', 'left', 'up', 'down'. \
+                                        Omit to infer it from the pin's orientation (stub points away \
+                                        from the symbol body). An explicit direction that points into \
+                                        the body is honored but flagged with a warning.",
+                        "enum": ["right", "left", "up", "down"]
                     },
                     "stub_length": { "type": "number", "default": 2.54,
                         "description": "Length of the wire stub in mm" },
@@ -1173,9 +1175,63 @@ async fn handle_connect_to_net(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let direction = opt_str(args, "direction").unwrap_or("right");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
+
+    // Locate the pin sitting at (pin_x, pin_y) to learn its orientation: the
+    // natural stub direction points away from the symbol body. Used as the
+    // default when no explicit direction is given, and to warn when an
+    // explicit direction would route the stub straight into the body.
+    let away_dir: Option<&'static str> = {
+        let (_, tree) = read_schematic(&sch_path)?;
+        let instances = extract_symbol_instances(&tree);
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+        let mut found = None;
+        'outer: for inst in &instances {
+            let t = inst.pin_transform();
+            for pin in konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id) {
+                let (px, py) = pin_endpoint(&pin, t);
+                if points_coincident(px, py, pin_x, pin_y, 0.02) {
+                    let (bx, by) = konnect_sexp::schematic::pin_body_vector(&pin, t);
+                    // Away from body = opposite of the body vector; map the
+                    // dominant axis to a cardinal direction (Y-down space).
+                    found = Some(if bx.abs() >= by.abs() {
+                        if bx > 0.0 { "left" } else { "right" }
+                    } else if by > 0.0 {
+                        "up"
+                    } else {
+                        "down"
+                    });
+                    break 'outer;
+                }
+            }
+        }
+        found
+    };
+
+    let explicit = opt_str(args, "direction");
+    let direction = explicit.or(away_dir).unwrap_or("right");
+    let mut warning: Option<String> = None;
+    if let (Some(d), Some(away)) = (explicit, away_dir) {
+        if d != away {
+            // Only complain when the stub is truly anti-parallel to the pin;
+            // perpendicular routing is legitimate.
+            let opposite = matches!(
+                (d, away),
+                ("left", "right") | ("right", "left") | ("up", "down") | ("down", "up")
+            );
+            if opposite {
+                warning = Some(format!(
+                    "direction '{}' points into the symbol body; the pin at ({}, {}) \
+                     faces '{}'",
+                    d, pin_x, pin_y, away
+                ));
+            }
+        }
+    }
 
     // Compute label endpoint and label rotation based on direction.
     // Label rotation follows KiCAD convention: 0° = text reads left-to-right,
@@ -1226,6 +1282,10 @@ async fn handle_connect_to_net(
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": direction,
+        "direction_source": if explicit.is_some() { "explicit" }
+                            else if away_dir.is_some() { "inferred_from_pin" }
+                            else { "default" },
+        "warning": warning,
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))

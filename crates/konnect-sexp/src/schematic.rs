@@ -331,6 +331,27 @@ pub fn pin_endpoint(pin: &LibPin, t: PinTransform) -> (f64, f64) {
     transform_pin(pin.local_x, pin.local_y, t)
 }
 
+/// Schematic-space unit vector pointing from the pin's electrical endpoint
+/// toward the symbol body (along the drawn pin line). The negation of this
+/// vector is the natural direction for wire stubs: away from the body.
+pub fn pin_body_vector(pin: &LibPin, t: PinTransform) -> (f64, f64) {
+    use std::f64::consts::PI;
+    let a = pin.rotation * PI / 180.0;
+    // Local Y-up direction toward the body, converted to schematic Y-down.
+    let mut dx = a.cos();
+    let mut dy = -a.sin();
+    if t.mirror_x {
+        dx = -dx;
+    }
+    if t.mirror_y {
+        dy = -dy;
+    }
+    // Same rotation convention as transform_pin (Y-down space).
+    let th = t.rotation_deg * PI / 180.0;
+    let (c, s) = (th.cos(), th.sin());
+    (dx * c - dy * s, -dx * s + dy * c)
+}
+
 // ─── T-Junction detection ─────────────────────────────────────────────────────
 
 use crate::geometry::point_on_segment;
