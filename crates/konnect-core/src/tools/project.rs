@@ -609,7 +609,7 @@ async fn handle_set_title_block(
                 }
                 node.push(qstr(value.to_owned()));
                 let node = SexpNode::List(node);
-                match children.iter().position(|c| matches(c)) {
+                match children.iter().position(matches) {
                     Some(i) => children[i] = node,
                     None => children.push(node),
                 }
