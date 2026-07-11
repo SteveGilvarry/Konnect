@@ -126,15 +126,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_net_label",
-            "Delete a net label by net name and position.",
+            "Delete a net label (local, global, or hierarchical). Target precisely by uuid \
+             (from list_schematic_labels), or by net name + position (closest match wins).",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "uuid": { "type": "string", "description": "Label UUID — exact targeting; net/x/y ignored when given" },
                     "net": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" }
                 },
-                "required": ["schematic", "net", "x", "y"]
+                "required": ["schematic"]
             }),
             |args, ctx| async move { handle_delete_net_label(args, ctx).await }
         ),
@@ -706,6 +708,40 @@ async fn handle_delete_net_label(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let content = std::fs::read_to_string(&sch_path)?;
+
+    // Top-level label node openers. Note: local labels are "(label" in the
+    // KiCad format — there is no "(net_label" node.
+    let label_starts_patterns = ["\n  (label", "\n  (global_label", "\n  (hierarchical_label"];
+
+    // Given an offset inside a label block, resolve the enclosing block bounds,
+    // verifying the offset actually falls within the block.
+    let enclosing_block = |offset: usize| -> Option<(usize, usize)> {
+        let before = &content[..offset];
+        let label_start = label_starts_patterns
+            .iter()
+            .filter_map(|s| before.rfind(s))
+            .max()?
+            + 1; // skip the leading newline of the pattern
+        let (del_start, del_end) = find_block_with_leading_whitespace(&content, label_start)?;
+        (offset < del_end).then_some((del_start, del_end))
+    };
+
+    // Precise path: delete by uuid.
+    if let Some(uuid) = opt_str(args, "uuid") {
+        let needle = format!(r#"(uuid "{uuid}")"#);
+        let uuid_offset = content
+            .find(&needle)
+            .ok_or_else(|| anyhow::anyhow!("No item with uuid '{}'", uuid))?;
+        let (del_start, del_end) = enclosing_block(uuid_offset)
+            .ok_or_else(|| anyhow::anyhow!("uuid '{}' is not inside a label", uuid))?;
+        let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
+        write_atomic(&sch_path, &new_content)?;
+        return Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })));
+    }
+
+    // Positional path: find ALL label occurrences with this net name, then pick
+    // the closest to (target_x, target_y) — handles multiple labels per net.
     let net = match require_str(args, "net") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -719,14 +755,8 @@ async fn handle_delete_net_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
-
-    // Find ALL label occurrences with this net name, then pick the closest to (target_x, target_y).
-    // This handles the common case of multiple labels on the same net.
     let search = format!(r#""{net}""#);
-    let label_starts_patterns = ["(net_label", "(global_label", "(hierarchical_label"];
-
-    let mut best_start = None;
+    let mut best: Option<(usize, usize)> = None;
     let mut best_dist = f64::MAX;
 
     let mut search_from = 0usize;
@@ -734,15 +764,9 @@ async fn handle_delete_net_label(
         .find(&search)
         .map(|i| i + search_from)
     {
-        // Walk back to find the enclosing label block
-        let before = &content[..name_offset];
-        if let Some(label_start) = label_starts_patterns
-            .iter()
-            .filter_map(|s| before.rfind(s))
-            .max()
-        {
+        if let Some((del_start, del_end)) = enclosing_block(name_offset) {
             // Parse the (at X Y) from this block to check proximity
-            let block_rest = &content[label_start..];
+            let block_rest = &content[del_start..del_end];
             if let Some(at_pos) = block_rest.find("(at ") {
                 let at_str = &block_rest[at_pos + 4..];
                 let parts: Vec<&str> = at_str.split([' ', ')']).collect();
@@ -752,7 +776,7 @@ async fn handle_delete_net_label(
                     let dist = (lx - target_x).abs() + (ly - target_y).abs();
                     if dist < best_dist {
                         best_dist = dist;
-                        best_start = Some(label_start);
+                        best = Some((del_start, del_end));
                     }
                 }
             }
@@ -760,13 +784,10 @@ async fn handle_delete_net_label(
         search_from = name_offset + 1;
     }
 
-    let label_start = best_start.ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
+    let (del_start, del_end) =
+        best.ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
 
-    let (del_start, del_end) = find_block_with_leading_whitespace(&content, label_start)
-        .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
-
-    let edits = vec![SexpEdit::delete(del_start, del_end)];
-    let new_content = apply_edits(content, edits);
+    let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
     write_atomic(&sch_path, &new_content)?;
     Ok(CallToolResult::json(
         &json!({ "deleted_label": net, "at": { "x": target_x, "y": target_y } }),
@@ -797,15 +818,40 @@ async fn handle_rotate_label(
 
     let content = std::fs::read_to_string(&sch_path)?;
     let search = format!(r#""{net}""#);
-    let found = content
-        .find(&search)
-        .ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
-    let before = &content[..found];
-    let label_start = ["(net_label", "(global_label", "(hierarchical_label"]
-        .iter()
-        .filter_map(|s| before.rfind(s))
-        .max()
-        .ok_or_else(|| anyhow::anyhow!("Label block not found"))?;
+
+    // Pick the label occurrence closest to (x, y) — local labels are "(label"
+    // in the KiCad format. TODO: also rewrite (effects (justify ...)) to match
+    // the new rotation, as the editor-based path does.
+    let patterns = ["\n  (label", "\n  (global_label", "\n  (hierarchical_label"];
+    let mut best_start: Option<usize> = None;
+    let mut best_dist = f64::MAX;
+    let mut search_from = 0usize;
+    while let Some(found) = content[search_from..].find(&search).map(|i| i + search_from) {
+        let before = &content[..found];
+        if let Some(ls) = patterns.iter().filter_map(|s| before.rfind(s)).max() {
+            let label_start = ls + 1;
+            if let Some((_, end)) = find_block_with_leading_whitespace(&content, label_start) {
+                if found < end {
+                    if let Some(at_pos) = content[label_start..end].find("(at ") {
+                        let at_str = &content[label_start + at_pos + 4..];
+                        let parts: Vec<&str> = at_str.split([' ', ')']).collect();
+                        if parts.len() >= 2 {
+                            let lx: f64 = parts[0].parse().unwrap_or(f64::MAX);
+                            let ly: f64 = parts[1].parse().unwrap_or(f64::MAX);
+                            let dist = (lx - x).abs() + (ly - y).abs();
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best_start = Some(label_start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        search_from = found + 1;
+    }
+    let label_start =
+        best_start.ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
 
     // Find the (at X Y ROT) in the label block
     let at_search = "(at ";
