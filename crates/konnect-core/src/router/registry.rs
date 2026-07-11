@@ -62,19 +62,19 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
+        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, save live board to disk (IPC-first with file fallback)",
         category: "pcb",
-        tool_count: 11,
+        tool_count: 12,
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, move, rotate, align, and duplicate PCB footprints",
+        description: "Place, move, rotate, align, duplicate, and query PCB footprints (IPC-first with file fallback)",
         category: "pcb",
         tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_routing",
-        description: "Traces, vias, copper pours, net classes, differential pairs",
+        description: "Traces, vias, copper pours, net classes, differential pairs (IPC-first with file fallback)",
         category: "pcb",
         tool_count: 12,
     },
