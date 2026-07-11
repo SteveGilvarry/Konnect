@@ -83,6 +83,43 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
         ),
         tool!(
+            "edit_component_field_position",
+            "Move a single property field (Reference, Value, or custom) of a symbol instance \
+             to an absolute position, optionally rotating it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator" },
+                    "field": { "type": "string", "description": "Field name, e.g. 'Reference', 'Value'" },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" },
+                    "rotation": { "type": "number", "description": "Field text rotation (default: keep current)" }
+                },
+                "required": ["schematic", "reference", "field", "x", "y"]
+            }),
+            |args, ctx| async move { handle_edit_field_position(args, ctx).await }
+        ),
+        tool!(
+            "autoplace_component_fields",
+            "KiCad-style field autoplacement: put Reference above and Value below the symbol \
+             body (bbox from pin endpoints) for one or more components. Fixes text-through-body \
+             rendering after rotations.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Components to autoplace; omit for ALL non-power symbols"
+                    }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_autoplace_fields(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_component",
             "Get all properties, position, and pin locations for a symbol instance.",
             json!({
@@ -514,6 +551,143 @@ async fn handle_edit_schematic_component(
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "changes": changed,
+        "errors": errors
+    })))
+}
+
+/// Byte range of the "X Y R" numbers inside a property's `(at X Y R)` node,
+/// within the symbol block for `reference`.
+fn field_at_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
+    let (sym_start, sym_end) = super::sch_batch::find_symbol_block(content, reference)?;
+    let block = &content[sym_start..sym_end];
+    let prop_pat = format!("(property \"{}\" ", field);
+    let prop_rel = block.find(&prop_pat)?;
+    let after = &block[prop_rel..];
+    let at_rel = after.find("(at ")? + 4;
+    let close_rel = after[at_rel..].find(')')? + at_rel;
+    Some((sym_start + prop_rel + at_rel, sym_start + prop_rel + close_rel))
+}
+
+async fn handle_edit_field_position(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let field = match require_str(args, "field") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    let content = std::fs::read_to_string(&sch_path)?;
+    let (start, end) = field_at_range(&content, &reference, &field).ok_or_else(|| {
+        anyhow::anyhow!("Field '{}' not found on '{}'", field, reference)
+    })?;
+    let rotation = match opt_f64(args, "rotation") {
+        Some(r) => r,
+        // keep the field's current rotation (3rd token, absent = 0)
+        None => content[start..end]
+            .split_whitespace()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+    };
+    let new_content = apply_edits(
+        content,
+        vec![SexpEdit::replace(start, end, format!("{} {} {}", x, y, rotation))],
+    );
+    write_atomic(&sch_path, &new_content)?;
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "field": field,
+        "at": { "x": x, "y": y, "rotation": rotation }
+    })))
+}
+
+async fn handle_autoplace_fields(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only: Option<Vec<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+
+    let (content, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+
+    let mut edits: Vec<SexpEdit> = Vec::new();
+    let mut placed: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for inst in &instances {
+        match &only {
+            Some(refs) if !refs.contains(&inst.reference) => continue,
+            None if inst.reference.starts_with('#') => continue,
+            _ => {}
+        }
+        let pins =
+            konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+        if pins.is_empty() {
+            errors.push(format!("{}: no pins resolved", inst.reference));
+            continue;
+        }
+        let t = inst.pin_transform();
+        let pts: Vec<(f64, f64)> = pins
+            .iter()
+            .map(|p| konnect_sexp::schematic::pin_endpoint(p, t))
+            .collect();
+        let (min_y, max_y) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+        let cx = {
+            let (lo, hi) = pts
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+            (lo + hi) / 2.0
+        };
+        // Reference above the body, Value below, both horizontal — the KiCad
+        // autoplace default. 1.27mm clears one text height from the pin bbox.
+        let targets = [
+            ("Reference", cx, min_y - 1.27),
+            ("Value", cx, max_y + 1.27),
+        ];
+        for (field, fx, fy) in targets {
+            match field_at_range(&content, &inst.reference, field) {
+                Some((start, end)) => {
+                    edits.push(SexpEdit::replace(start, end, format!("{} {} 0", fx, fy)));
+                }
+                None => errors.push(format!("{}: field '{}' not found", inst.reference, field)),
+            }
+        }
+        placed.push(json!({ "reference": inst.reference, "ref_at": [cx, min_y - 1.27], "value_at": [cx, max_y + 1.27] }));
+    }
+
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        write_atomic(&sch_path, &new_content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "autoplaced": placed.len(),
+        "components": placed,
         "errors": errors
     })))
 }
