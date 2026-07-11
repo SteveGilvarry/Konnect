@@ -811,8 +811,133 @@ async fn handle_check_overlaps(
         }
     }
 
+    // Label-text-over-symbol detection. Estimate each label's text box from
+    // its length and rotation (KiCad default font ≈ 1.3mm advance per char at
+    // 1.27mm size; text extends in reading direction from the anchor, which is
+    // how label_effects_for_rotation places justify). Symbol bounds are
+    // approximated by the bbox of the symbol's pin endpoints padded by one
+    // grid unit — good enough to flag text running through a body.
+    let (_, tree) = konnect_sexp::schematic::read_schematic(&sch_path)?;
+    let instances = konnect_sexp::schematic::extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+
+    struct SymBox {
+        reference: String,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+        pin_pts: Vec<(f64, f64)>,
+    }
+    let mut sym_boxes: Vec<SymBox> = Vec::new();
+    for inst in &instances {
+        if inst.reference.starts_with('#') {
+            continue; // power symbols: tiny, labels legitimately sit close
+        }
+        let t = inst.pin_transform();
+        let pins = konnect_sexp::schematic::resolve_lib_pins(&lib_syms, &inst.lib_id);
+        if pins.is_empty() {
+            continue;
+        }
+        let pts: Vec<(f64, f64)> = pins
+            .iter()
+            .map(|p| konnect_sexp::schematic::pin_endpoint(p, t))
+            .collect();
+        // Pin endpoints are a symbol's outermost extent along the pin axis
+        // (the body sits inside them), so no padding there — but a 2-pin part
+        // has zero extent on the perpendicular axis while its body is ~4mm
+        // wide. Expand each axis to a minimum extent around its centre.
+        let (mut min_x, mut max_x) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+        let (mut min_y, mut max_y) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+        const MIN_EXTENT: f64 = 3.81;
+        if max_x - min_x < MIN_EXTENT {
+            let c = (max_x + min_x) / 2.0;
+            min_x = c - MIN_EXTENT / 2.0;
+            max_x = c + MIN_EXTENT / 2.0;
+        }
+        if max_y - min_y < MIN_EXTENT {
+            let c = (max_y + min_y) / 2.0;
+            min_y = c - MIN_EXTENT / 2.0;
+            max_y = c + MIN_EXTENT / 2.0;
+        }
+        sym_boxes.push(SymBox {
+            reference: inst.reference.clone(),
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            pin_pts: pts,
+        });
+    }
+
+    // Rotation-aware text box for a label anchored at (x, y).
+    let label_box = |net: &str, x: f64, y: f64, rot: f64| -> (f64, f64, f64, f64) {
+        let size = 1.27;
+        let w = net.chars().count() as f64 * size * 1.05;
+        let h = size * 1.6;
+        match rot as i64 {
+            180 => (x - w, y - h, x, y),
+            90 => (x - h, y - w, x, y),
+            270 => (x, y, x + h, y + w),
+            _ => (x, y - h, x + w, y),
+        }
+    };
+    let boxes_intersect = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| -> bool {
+        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+    };
+
+    let mut text_over_symbol: Vec<serde_json::Value> = Vec::new();
+    let label_rot = |x: f64, y: f64| -> f64 {
+        // recover rotation from the schematic model lists
+        sch.labels
+            .iter()
+            .map(|l| (l.at.x, l.at.y, l.at.rotation))
+            .chain(sch.global_labels.iter().map(|g| (g.at.x, g.at.y, g.at.rotation)))
+            .chain(
+                sch.hierarchical_labels
+                    .iter()
+                    .map(|h| (h.at.x, h.at.y, h.at.rotation)),
+            )
+            .find(|(lx, ly, _)| points_coincident(*lx, *ly, x, y, 0.01))
+            .and_then(|(_, _, r)| r)
+            .unwrap_or(0.0)
+    };
+    for l in &all_labels {
+        let rot = label_rot(l.x, l.y);
+        let lbox = label_box(&l.net, l.x, l.y, rot);
+        // shrink slightly so an anchor merely touching a bbox edge doesn't fire
+        let lbox = (lbox.0 + tol, lbox.1 + tol, lbox.2 - tol, lbox.3 - tol);
+        for sb in &sym_boxes {
+            // A label attached to one of this symbol's pins points away from
+            // the body by construction — skip its own attachment.
+            let attached = sb
+                .pin_pts
+                .iter()
+                .any(|(px, py)| points_coincident(*px, *py, l.x, l.y, 0.02));
+            if attached {
+                continue;
+            }
+            if boxes_intersect(lbox, (sb.min_x, sb.min_y, sb.max_x, sb.max_y)) {
+                text_over_symbol.push(json!({
+                    "type": "label_text_over_symbol",
+                    "net": l.net,
+                    "symbol": sb.reference,
+                    "label_x": l.x, "label_y": l.y
+                }));
+            }
+        }
+    }
+
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
+    all.extend(text_over_symbol);
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
