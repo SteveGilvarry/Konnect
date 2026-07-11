@@ -112,7 +112,11 @@ pub struct Label {
 pub fn extract_labels(tree: &SexpNode) -> Vec<Label> {
     let mut labels = Vec::new();
 
+    // Local labels are "(label ...)" nodes in the KiCad format; "net_label"
+    // is kept for backward compatibility with files written by old Konnect
+    // builds (which emitted that invalid node type).
     for (kind_str, kind) in &[
+        ("label", LabelKind::NetLabel),
         ("net_label", LabelKind::NetLabel),
         ("global_label", LabelKind::GlobalLabel),
         ("hierarchical_label", LabelKind::HierarchicalLabel),

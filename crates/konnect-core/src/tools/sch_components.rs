@@ -638,10 +638,132 @@ async fn handle_autoplace_fields(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let wires = konnect_sexp::schematic::extract_wires(&tree);
+    let labels = konnect_sexp::schematic::extract_labels(&tree);
+
+    // Obstacle set: every symbol's pin bbox (incl. power symbols — their
+    // wires and arrows are exactly what fields keep landing on), every wire
+    // segment, every label's estimated text box (conservatively extended in
+    // both reading directions since rotation isn't tracked here).
+    #[derive(Clone, Copy)]
+    struct Box4 {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    }
+    let mut sym_boxes: Vec<(String, Box4)> = Vec::new();
+    let mut bbox_of = std::collections::HashMap::new();
+    for inst in &instances {
+        let t = inst.pin_transform();
+        let pts: Vec<(f64, f64)> = konnect_sexp::schematic::resolve_lib_pins_for_unit(
+            &lib_syms,
+            &inst.lib_id,
+            inst.unit,
+        )
+        .iter()
+        .map(|p| konnect_sexp::schematic::pin_endpoint(p, t))
+        .collect();
+        if pts.is_empty() {
+            continue;
+        }
+        let (mut x1, mut x2) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+        let (mut y1, mut y2) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+        if inst.reference.starts_with('#') {
+            // Power symbol: one pin, but the arrow/bar graphic plus its net
+            // name text hang ~5mm off the pin in an unknown direction.
+            let (cx, cy) = pts[0];
+            x1 = cx - 2.8;
+            x2 = cx + 2.8;
+            y1 = cy - 4.2;
+            y2 = cy + 4.2;
+        } else {
+            const MIN_EXTENT: f64 = 3.81;
+            if x2 - x1 < MIN_EXTENT {
+                let c = (x1 + x2) / 2.0;
+                x1 = c - MIN_EXTENT / 2.0;
+                x2 = c + MIN_EXTENT / 2.0;
+            }
+            if y2 - y1 < MIN_EXTENT {
+                let c = (y1 + y2) / 2.0;
+                y1 = c - MIN_EXTENT / 2.0;
+                y2 = c + MIN_EXTENT / 2.0;
+            }
+            if pts.len() >= 3 {
+                // IC bodies extend past the pin-row hull (e.g. above the top
+                // side-pin row); pad so fields clear the drawn rectangle.
+                x1 -= 1.0;
+                x2 += 1.0;
+                y1 -= 2.0;
+                y2 += 2.0;
+            }
+        }
+        let b = Box4 { x1, y1, x2, y2 };
+        sym_boxes.push((inst.reference.clone(), b));
+        bbox_of.insert(
+            (inst.reference.clone(), inst.unit),
+            (b, (x1 + x2) / 2.0, (y1 + y2) / 2.0),
+        );
+    }
+    let label_boxes: Vec<Box4> = labels
+        .iter()
+        .map(|l| {
+            // Text extends in reading direction from the anchor (justify
+            // tracks rotation), plus ~2mm for global-label flag chrome.
+            let w = l.net.chars().count() as f64 * 1.33 + 2.0;
+            match l.rotation as i64 {
+                180 => Box4 { x1: l.x - w, y1: l.y - 1.4, x2: l.x, y2: l.y + 1.4 },
+                90 => Box4 { x1: l.x - 1.4, y1: l.y - w, x2: l.x + 1.4, y2: l.y },
+                270 => Box4 { x1: l.x - 1.4, y1: l.y, x2: l.x + 1.4, y2: l.y + w },
+                _ => Box4 { x1: l.x, y1: l.y - 1.4, x2: l.x + w, y2: l.y + 1.4 },
+            }
+        })
+        .collect();
+
+    let boxes_hit = |a: Box4, b: Box4| a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+    // Estimated text box for a centered field anchored at (x, y).
+    let text_box = |txt: &str, x: f64, y: f64| -> Box4 {
+        let w = (txt.chars().count() as f64 * 1.33).max(2.0);
+        Box4 {
+            x1: x - w / 2.0,
+            y1: y - 1.3,
+            x2: x + w / 2.0,
+            y2: y + 1.3,
+        }
+    };
+    let collides = |b: Box4, own_ref: &str| -> bool {
+        for w in &wires {
+            let wb = Box4 {
+                x1: w.x1.min(w.x2) - 0.2,
+                y1: w.y1.min(w.y2) - 0.2,
+                x2: w.x1.max(w.x2) + 0.2,
+                y2: w.y1.max(w.y2) + 0.2,
+            };
+            if boxes_hit(b, wb) {
+                return true;
+            }
+        }
+        for (r, sb) in &sym_boxes {
+            if r != own_ref && boxes_hit(b, *sb) {
+                return true;
+            }
+        }
+        label_boxes.iter().any(|lb| boxes_hit(b, *lb))
+    };
 
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut placed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    // Text boxes already claimed by fields placed earlier in this run, so two
+    // neighbouring parts don't both pick the same free spot.
+    let mut claimed: Vec<Box4> = Vec::new();
+    // Multi-unit parts share one field set on the first unit's block; only
+    // place it once per reference.
+    let mut done_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for inst in &instances {
         match &only {
@@ -649,41 +771,62 @@ async fn handle_autoplace_fields(
             None if inst.reference.starts_with('#') => continue,
             _ => {}
         }
-        let pins =
-            konnect_sexp::schematic::resolve_lib_pins_for_unit(&lib_syms, &inst.lib_id, inst.unit);
-        if pins.is_empty() {
-            errors.push(format!("{}: no pins resolved", inst.reference));
+        if !done_refs.insert(inst.reference.clone()) {
             continue;
         }
-        let t = inst.pin_transform();
-        let pts: Vec<(f64, f64)> = pins
-            .iter()
-            .map(|p| konnect_sexp::schematic::pin_endpoint(p, t))
-            .collect();
-        let (min_y, max_y) = pts
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
-        let cx = {
-            let (lo, hi) = pts
-                .iter()
-                .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
-            (lo + hi) / 2.0
+        let Some(&(b, cx, cy)) = bbox_of.get(&(inst.reference.clone(), inst.unit)) else {
+            errors.push(format!("{}: no pins resolved", inst.reference));
+            continue;
         };
-        // Reference above the body, Value below, both horizontal — the KiCad
-        // autoplace default. 1.27mm clears one text height from the pin bbox.
-        let targets = [
-            ("Reference", cx, min_y - 1.27),
-            ("Value", cx, max_y + 1.27),
-        ];
-        for (field, fx, fy) in targets {
+        let ref_txt = inst.reference.clone();
+        let val_txt = inst.value.clone();
+        let wmax = (ref_txt.chars().count().max(val_txt.chars().count()) as f64 * 1.33) / 2.0;
+
+        // Candidate anchor pairs (Reference, Value), nearest first: right,
+        // left, above, below — each at growing clearance.
+        let mut chosen: Option<((f64, f64), (f64, f64))> = None;
+        'search: for gap in [1.0, 2.5, 4.0, 6.0] {
+            let cands = [
+                ((b.x2 + gap + wmax, cy - 1.7), (b.x2 + gap + wmax, cy + 1.7)),
+                ((b.x1 - gap - wmax, cy - 1.7), (b.x1 - gap - wmax, cy + 1.7)),
+                ((cx, b.y1 - gap - 4.2), (cx, b.y1 - gap - 0.9)),
+                ((cx, b.y2 + gap + 0.9), (cx, b.y2 + gap + 4.2)),
+            ];
+            for (rp, vp) in cands {
+                let rb = text_box(&ref_txt, rp.0, rp.1);
+                let vb = text_box(&val_txt, vp.0, vp.1);
+                let hit_claimed =
+                    claimed.iter().any(|c| boxes_hit(rb, *c) || boxes_hit(vb, *c));
+                if !hit_claimed && !collides(rb, &inst.reference) && !collides(vb, &inst.reference)
+                {
+                    chosen = Some((rp, vp));
+                    claimed.push(rb);
+                    claimed.push(vb);
+                    break 'search;
+                }
+            }
+        }
+        // Nothing collision-free nearby: fall back to above/below like KiCad.
+        let ((rx, ry), (vx, vy)) =
+            chosen.unwrap_or(((cx, b.y1 - 1.8), (cx, b.y2 + 1.8)));
+
+        // Property rotation composes with the symbol rotation at render time;
+        // counter-rotate so the text always reads horizontally.
+        let frot = if (inst.rotation as i64 % 180).abs() == 90 { 90 } else { 0 };
+        for (field, fx, fy) in [("Reference", rx, ry), ("Value", vx, vy)] {
             match field_at_range(&content, &inst.reference, field) {
                 Some((start, end)) => {
-                    edits.push(SexpEdit::replace(start, end, format!("{} {} 0", fx, fy)));
+                    edits.push(SexpEdit::replace(start, end, format!("{} {} {}", fx, fy, frot)));
                 }
                 None => errors.push(format!("{}: field '{}' not found", inst.reference, field)),
             }
         }
-        placed.push(json!({ "reference": inst.reference, "ref_at": [cx, min_y - 1.27], "value_at": [cx, max_y + 1.27] }));
+        placed.push(json!({
+            "reference": inst.reference,
+            "ref_at": [rx, ry],
+            "value_at": [vx, vy],
+            "collision_free": chosen.is_some()
+        }));
     }
 
     if !edits.is_empty() {
