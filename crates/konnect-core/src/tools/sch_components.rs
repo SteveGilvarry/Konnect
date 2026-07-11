@@ -449,91 +449,72 @@ async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use super::sch_batch::{field_value_range, insert_property_edit};
+
     let sch_path = get_path(args, "schematic")?;
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut edits: Vec<SexpEdit> = Vec::new();
     let mut changed = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
-    // Helper: update a property field value in-place
-    let update_field = |content: &str, ref_: &str, field: &str, new_val: &str| -> (String, bool) {
-        // Pattern: (property "FieldName" "OldValue"
-        //           surrounded by the enclosing symbol block for 'ref_'
-        // Simple approach: find the reference location, then within that symbol block
-        // update the named property.
-        let ref_search = format!(r#"(property "Reference" "{ref_}""#);
-        let ref_pos = match content.find(&ref_search) {
-            Some(p) => p,
-            None => return (content.to_string(), false),
-        };
-        // Find the symbol block around this reference
-        let sym_start_str = "\n  (symbol";
-        let before = &content[..ref_pos];
-        let sym_start = match before.rfind(sym_start_str) {
-            Some(p) => p + 1,
-            None => return (content.to_string(), false),
-        };
-        let (_, sym_end) = match find_block_with_leading_whitespace(content, sym_start) {
-            Some(r) => r,
-            None => return (content.to_string(), false),
-        };
-        let sym_block = &content[sym_start..sym_end];
-        let field_search = format!(r#"(property "{field}" ""#);
-        let field_offset = match sym_block.find(&field_search) {
-            Some(o) => sym_start + o + field_search.len(),
-            None => return (content.to_string(), false),
-        };
-        // Find the closing quote of the current value
-        let val_end = match content[field_offset..].find('"') {
-            Some(o) => field_offset + o,
-            None => return (content.to_string(), false),
-        };
-        let new_content = format!(
-            "{}{}{}",
-            &content[..field_offset],
-            new_val,
-            &content[val_end..]
-        );
-        (new_content, true)
-    };
-
-    if let Some(new_ref) = opt_str(args, "new_reference") {
-        let (c, ok) = update_field(&content, &reference, "Reference", new_ref);
-        if ok {
-            content = c;
-            changed.push(format!("Reference → {}", new_ref));
-        }
-    }
-    if let Some(val) = opt_str(args, "value") {
-        let (c, ok) = update_field(&content, &reference, "Value", val);
-        if ok {
-            content = c;
-            changed.push(format!("Value → {}", val));
-        }
-    }
-    if let Some(fp) = opt_str(args, "footprint") {
-        let (c, ok) = update_field(&content, &reference, "Footprint", fp);
-        if ok {
-            content = c;
-            changed.push(format!("Footprint → {}", fp));
-        }
-    }
-    if let Some(ds) = opt_str(args, "datasheet") {
-        let (c, ok) = update_field(&content, &reference, "Datasheet", ds);
-        if ok {
-            content = c;
-            changed.push(format!("Datasheet → {}", ds));
+    // Standard fields always exist on a symbol instance: replace in place.
+    // Custom fields from "fields" may be new: replace-or-insert.
+    let standard = [
+        ("Reference", opt_str(args, "new_reference")),
+        ("Value", opt_str(args, "value")),
+        ("Footprint", opt_str(args, "footprint")),
+        ("Datasheet", opt_str(args, "datasheet")),
+    ];
+    for (field, val) in standard {
+        let Some(new_val) = val else { continue };
+        match field_value_range(&content, &reference, field) {
+            Some((start, end)) => {
+                edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+                changed.push(format!("{} → {}", field, new_val));
+            }
+            None => errors.push(format!("Field '{}' not found on '{}'", field, reference)),
         }
     }
 
-    write_atomic(&sch_path, &content)?;
+    if let Some(fields_obj) = args["fields"].as_object() {
+        for (field_name, field_val) in fields_obj {
+            let Some(new_val) = field_val.as_str() else {
+                errors.push(format!("Field '{}' value must be a string", field_name));
+                continue;
+            };
+            match field_value_range(&content, &reference, field_name) {
+                Some((start, end)) => {
+                    edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+                    changed.push(format!("{} → {}", field_name, new_val));
+                }
+                None => match insert_property_edit(&content, &reference, field_name, new_val) {
+                    Some(edit) => {
+                        edits.push(edit);
+                        changed.push(format!("{} + {}", field_name, new_val));
+                    }
+                    None => errors.push(format!(
+                        "Symbol '{}' not found for new field '{}'",
+                        reference, field_name
+                    )),
+                },
+            }
+        }
+    }
+
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        write_atomic(&sch_path, &new_content)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
-        "changes": changed
+        "changes": changed,
+        "errors": errors
     })))
 }
 

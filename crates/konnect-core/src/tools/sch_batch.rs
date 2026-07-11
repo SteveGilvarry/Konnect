@@ -238,7 +238,7 @@ pub fn tools() -> Vec<ToolDef> {
 
 /// Find the `(symbol ...)` block for a reference designator.
 /// Returns `(block_start, block_end)` byte offsets in `content`.
-fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
+pub(crate) fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
     let search_pat = format!(r#"(property "Reference" "{reference}""#);
     let ref_offset = content.find(&search_pat)?;
     let before = &content[..ref_offset];
@@ -250,7 +250,7 @@ fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
 /// of a `(property "FieldName" "VALUE" ...)` node within the symbol identified by
 /// `reference`. Only the bytes inside the opening quote are included (i.e. the
 /// replacement does NOT need to include surrounding quotes).
-fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
+pub(crate) fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
     let ref_search = format!(r#"(property "Reference" "{reference}""#);
     let ref_pos = content.find(&ref_search)?;
     let before = &content[..ref_pos];
@@ -271,7 +271,7 @@ fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usi
 /// not exist yet (e.g. stamping MPN/LCSC fields). The property is placed at the
 /// symbol origin, hidden, and inserted just before the `(instances` node so the
 /// file stays in canonical property order.
-fn insert_property_edit(
+pub(crate) fn insert_property_edit(
     content: &str,
     reference: &str,
     field: &str,
