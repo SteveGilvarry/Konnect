@@ -178,6 +178,29 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_register_symbol_library(args, ctx).await }
         ),
         tool!(
+            "unregister_library",
+            "Remove a library entry by nickname from a KiCAD symbol or footprint library table. \
+             Does not delete the library files themselves.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "nickname": { "type": "string", "description": "Library nickname to remove" },
+                    "table": {
+                        "type": "string",
+                        "description": "Which table: 'symbol' or 'footprint'"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Scope: 'global' or 'project'",
+                        "default": "project"
+                    },
+                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" }
+                },
+                "required": ["nickname", "table"]
+            }),
+            |args, ctx| async move { handle_unregister_library(args, ctx).await }
+        ),
+        tool!(
             "list_symbol_libraries",
             "List all registered symbol libraries (global and optionally project-level).",
             json!({
@@ -641,6 +664,89 @@ async fn handle_register_symbol_library(
         }))
         .unwrap(),
     ))
+}
+
+async fn handle_unregister_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let nickname = match require_str(args, "nickname") {
+        Ok(n) => n.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let table_kind = match require_str(args, "table") {
+        Ok(t) => t.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let scope = args["scope"].as_str().unwrap_or("project");
+
+    let table_path = match (table_kind.as_str(), scope) {
+        ("symbol", "global") => global_sym_lib_table(),
+        ("footprint", "global") => global_fp_lib_table(),
+        (kind, "project") => {
+            let Some(proj) = args["project"].as_str() else {
+                return Ok(CallToolResult::error(
+                    "For project scope, provide 'project' path to .kicad_pro file",
+                ));
+            };
+            let file = if kind == "symbol" {
+                "sym-lib-table"
+            } else if kind == "footprint" {
+                "fp-lib-table"
+            } else {
+                return Ok(CallToolResult::error("'table' must be 'symbol' or 'footprint'"));
+            };
+            PathBuf::from(proj)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(file)
+        }
+        _ => return Ok(CallToolResult::error("'table' must be 'symbol' or 'footprint'")),
+    };
+
+    if !table_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Library table not found: {}",
+            table_path.display()
+        )));
+    }
+
+    let content = tokio::fs::read_to_string(&table_path).await?;
+    // Entries are one `(lib ...)` node per line in tables this tool manages;
+    // match by the exact (name "nickname") token to avoid prefix collisions.
+    let needle = format!(r#"(name "{nickname}")"#);
+    let mut removed = 0usize;
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let hit = line.trim_start().starts_with("(lib ") && line.contains(&needle);
+            if hit {
+                removed += 1;
+            }
+            !hit
+        })
+        .collect();
+
+    if removed == 0 {
+        return Ok(CallToolResult::error(format!(
+            "No entry named '{}' in {}",
+            nickname,
+            table_path.display()
+        )));
+    }
+
+    let mut new_content = kept.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    write_atomic(&table_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "nickname": nickname,
+        "removed_entries": removed,
+        "table": table_path.to_str().unwrap_or("")
+    })))
 }
 
 async fn handle_list_symbol_libraries(
