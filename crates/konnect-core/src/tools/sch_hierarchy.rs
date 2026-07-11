@@ -762,6 +762,28 @@ fn repair_walk(
     // prefix from nested unit names so they match KiCAD's expected format.
     let renamed_units = fix_embedded_unit_names(&mut sch);
 
+    // Refresh embedded lib_symbols from their source libraries so edits to a
+    // library (custom symbols especially) propagate and lib_symbol_mismatch
+    // warnings clear.
+    for node in sch.raw_other.iter_mut() {
+        if node.tag() != Some("lib_symbols") {
+            continue;
+        }
+        if let cse::sexp::SexpNode::List(entries) = node {
+            for entry in entries.iter_mut().skip(1) {
+                if entry.tag() != Some("symbol") {
+                    continue;
+                }
+                let Some(name) = entry.value().map(str::to_owned) else {
+                    continue;
+                };
+                if let Some(fresh) = cse::library::resolve_lib_symbol_node_flattened(&name) {
+                    *entry = fresh;
+                }
+            }
+        }
+    }
+
     // Global/hierarchical labels written without (effects (justify ...)) render
     // with their body extending right of the anchor regardless of rotation,
     // covering whatever they point at. Retrofit rotation-appropriate justify.

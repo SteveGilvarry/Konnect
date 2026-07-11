@@ -767,21 +767,59 @@ async fn handle_create_symbol(
         ));
     }
 
+    // Auto body rectangle: span the pin bounding box inset by each side's pin
+    // length so the box meets the pin roots. A symbol without a body renders
+    // as floating pin stubs.
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    let mut max_len = 2.54f64;
+    for pin in &pins_val {
+        let x = pin["x"].as_f64().unwrap_or(0.0);
+        let y = pin["y"].as_f64().unwrap_or(0.0);
+        max_len = max_len.max(pin["length"].as_f64().unwrap_or(2.54));
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let body = if pins_val.is_empty() {
+        String::new()
+    } else {
+        let (bx1, bx2) = (min_x + max_len, max_x - max_len);
+        let (by1, by2) = (min_y - 2.54, max_y + 2.54);
+        format!(
+            r#"
+      (rectangle (start {} {}) (end {} {})
+        (stroke (width 0.254) (type default))
+        (fill (type background))
+      )"#,
+            bx1, by2, bx2, by1
+        )
+    };
+    let ref_y = if pins_val.is_empty() {
+        0.0
+    } else {
+        max_y + 4.5
+    };
+    let val_y = if pins_val.is_empty() {
+        -2.54
+    } else {
+        min_y - 4.5
+    };
+
     let symbol_sexp = format!(
         r#"
   (symbol "{}"
-    (pin_numbers hide)
-    (pin_names (offset 1.016) hide)
+    (pin_names (offset 1.016))
     (in_bom yes)
     (on_board yes)
-    (property "Reference" "{}" (at 0 0 0) (effects (font (size 1.27 1.27))))
-    (property "Value" "{}" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
+    (property "Reference" "{}" (at 0 {} 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "{}" (at 0 {} 0) (effects (font (size 1.27 1.27))))
     (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
     (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (symbol "{}_0_1"{}
+    (symbol "{}_0_1"{}{}
     )
   )"#,
-        name, ref_prefix, value_str, name, pins_sexp
+        name, ref_prefix, ref_y, value_str, val_y, name, body, pins_sexp
     );
 
     // If file doesn't exist, create scaffold
