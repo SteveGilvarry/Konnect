@@ -27,3 +27,6 @@ usvg.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Mock KiCAD NNG server for IPC-first/file-fallback and write-refusal tests
+nng.workspace = true
+prost.workspace = true

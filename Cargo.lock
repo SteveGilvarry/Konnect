@@ -945,6 +945,8 @@ dependencies = [
  "konnect-ipc",
  "konnect-schematic-editor",
  "konnect-sexp",
+ "nng",
+ "prost",
  "prost-types",
  "reqwest",
  "rusqlite",
