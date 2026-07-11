@@ -23,6 +23,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output .kicad_mod file path" },
                     "name": { "type": "string", "description": "Footprint name" },
                     "description": { "type": "string", "description": "Footprint description (optional)" },
+                    "body_width": { "type": "number", "description": "Package body width in mm (drawn on F.Fab; courtyard wraps pads+body). Default: pad bbox" },
+                    "body_height": { "type": "number", "description": "Package body height in mm" },
                     "pads": {
                         "type": "array",
                         "description": "Pad definitions",
@@ -322,13 +324,64 @@ async fn handle_create_footprint(
         ));
     }
 
+    // Fabrication body, silkscreen pin-1 marker, and courtyard. A footprint
+    // without these passes nothing to assembly (no polarity mark) and trips
+    // DRC courtyard checks; generate them from the pad bbox / body dims.
+    let graphics_sexp = {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for pad in &pads_val {
+            let x = pad["x"].as_f64().unwrap_or(0.0);
+            let y = pad["y"].as_f64().unwrap_or(0.0);
+            let w = pad["width"].as_f64().unwrap_or(1.0);
+            let h = pad["height"].as_f64().unwrap_or(1.0);
+            min_x = min_x.min(x - w / 2.0);
+            max_x = max_x.max(x + w / 2.0);
+            min_y = min_y.min(y - h / 2.0);
+            max_y = max_y.max(y + h / 2.0);
+        }
+        if pads_val.is_empty() {
+            String::new()
+        } else {
+            let bw = args["body_width"].as_f64().unwrap_or(max_x - min_x);
+            let bh = args["body_height"].as_f64().unwrap_or(max_y - min_y);
+            let (bx1, by1, bx2, by2) = (-bw / 2.0, -bh / 2.0, bw / 2.0, bh / 2.0);
+            let (cx1, cy1, cx2, cy2) = (
+                min_x.min(bx1) - 0.25,
+                min_y.min(by1) - 0.25,
+                max_x.max(bx2) + 0.25,
+                max_y.max(by2) + 0.25,
+            );
+            // pin-1 dot outside the courtyard corner nearest pad 1
+            let (p1x, p1y) = pads_val
+                .iter()
+                .find(|p| p["number"].as_str() == Some("1"))
+                .map(|p| (p["x"].as_f64().unwrap_or(0.0), p["y"].as_f64().unwrap_or(0.0)))
+                .unwrap_or((cx1, cy1));
+            let dot_x = if p1x < 0.0 { cx1 - 0.5 } else { cx2 + 0.5 };
+            let dot_y = if p1y < 0.0 { cy1 } else { cy2 };
+            format!(
+                r#"
+  (fp_rect (start {bx1:.3} {by1:.3}) (end {bx2:.3} {by2:.3})
+    (stroke (width 0.1) (type solid)) (fill no) (layer "F.Fab"))
+  (fp_rect (start {cx1:.3} {cy1:.3}) (end {cx2:.3} {cy2:.3})
+    (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+  (fp_circle (center {dot_x:.3} {dot_y:.3}) (end {dot_end:.3} {dot_y:.3})
+    (stroke (width 0.3) (type solid)) (fill yes) (layer "F.SilkS"))
+  (fp_text user "${{REFERENCE}}" (at 0 0) (layer "F.Fab")
+    (effects (font (size 1 1) (thickness 0.15))))"#,
+                dot_end = dot_x + 0.15,
+            )
+        }
+    };
+
     let content = format!(
         r#"(footprint "{}"
   (version 20260206)
   (generator "konnect")
   (layer "F.Cu")
   (descr "{}")
-  (attr {}){}
+  (attr {}){}{}
 )"#,
         name,
         description,
@@ -337,6 +390,7 @@ async fn handle_create_footprint(
         } else {
             "through_hole"
         },
+        graphics_sexp,
         pad_sexp
     );
 
